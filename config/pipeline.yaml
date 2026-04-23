@@ -1,0 +1,185 @@
+# Single source of truth for all pipeline stages.
+# Relative paths are resolved from the repo root (Drilling - End to End Prediction/).
+
+# ---------------------------------------------------------------------------
+# Data sources — preprocessing joins these on row_id to produce train-ready data
+# ---------------------------------------------------------------------------
+data:
+  master_csv:   "../Data/Master_Data_With_ID.csv"
+  comments_csv: "../Data/Comment_Features.csv"
+  output_dir:   "../Data/Data for model (E2E)"    # preprocessing writes here
+
+# ---------------------------------------------------------------------------
+# Preprocessing — which master columns enter the pipeline, and which are
+# dropped after contributing to derived features. Comment-side keep-lists
+# live under `features:` below (comment_numeric / comment_obs_flags).
+# ---------------------------------------------------------------------------
+preprocessing:
+  # Columns to keep from Master_Data_With_ID.csv at load time.
+  # Anything not in this list is dropped in join.py before features.py sees it.
+  master_keep:
+    - row_id
+    - Well_Name
+    - Report_Date
+    - Job_Report_Start_Date
+    - Start_Time
+    - End_Time
+    - Start_Hour
+    - End_Hour
+    - Ops_Summary
+    - Phase
+    - Phase_Step
+    - Major_Ops_Code
+    - Operation
+    - Duration hours
+    - DepthStart_ft
+    - DepthEnd_ft
+    - Planned_Start_Depth
+    - Planned_End_Depth
+    - Planned_Phase_Duration_Hours
+    - Target_Depth
+    - Operator
+    - Rig_Contractor
+
+  # Columns that serve only as inputs to derived features in features.engineer().
+  # Dropped at the end of engineer() so they never reach the model as predictors.
+  drop_after_derivation:
+    - Target_Depth    # used by depth_progress; not meaningful as a standalone feature
+
+  # Unplanned operations — operation-level strings that represent unpredictable
+  # sidetracks from the planned drilling workflow (NPT events, waits, well-control,
+  # fishing, etc.). These are merged under `unplanned_token` and loss-masked on the
+  # operation, major_ops_code, and duration heads so the model learns the planned
+  # workflow, not the interruptions. SME-maintained; edit freely.
+  unplanned_operations:
+    - RIG_RPR_NPT
+    - 3RD_PTY
+    - WAIT
+    - WOW
+    - H2S_FALSE
+    - LEL_FALSE
+    - WELL_CTRL
+    - K&M_CLEANUP
+    - DRL_K&M
+    - LCM_SQUEEZE
+    - PACKOFF
+    - JAR
+    - FISH
+    - PULL_CSG
+    - PULL_LNR
+    - CMT_REM
+    - SFTY_NPT
+  unplanned_token: "Unplanned"
+
+# ---------------------------------------------------------------------------
+# Feature selection — the subset of Comment_Features to keep as model inputs.
+# Edit freely: preprocessing/features.py reads this list and ignores all others.
+# ---------------------------------------------------------------------------
+features:
+  comment_numeric:
+    - wob_klbs
+    - spp_psi
+    - rpm
+    - gpm
+    - diff_psi
+    - torque_kftlbs
+    - rop_ft_hr
+    - casing_size_in
+    - casing_weight_ppf
+    - lead_cement_bbls
+  comment_obs_flags:
+    - wob_klbs_obs
+    - spp_psi_obs
+    - rpm_obs
+    - gpm_obs
+    - diff_psi_obs
+    - torque_kftlbs_obs
+    - rop_ft_hr_obs
+    - casing_size_in_obs
+    - casing_weight_ppf_obs
+    - lead_cement_bbls_obs
+    - flag_proper_displacement
+  operator_column: "Operator"          # one-hot encoded if present
+  rig_column:      "Rig_Contractor"    # one-hot encoded if present
+
+# ---------------------------------------------------------------------------
+# Splitting
+# ---------------------------------------------------------------------------
+split:
+  random_state:         16
+  test_well_fraction:   0.20
+  val_well_fraction:    0.15    # fraction of non-test wells
+
+# ---------------------------------------------------------------------------
+# Encoding — all three strategies are produced (dummies / embed_separate / embed_state)
+# ---------------------------------------------------------------------------
+encoding:
+  strategies: ["dummies", "embed_separate", "embed_state"]
+  eoo_token:  "End of Operations"    # well-boundary sentinel class for all 4 hierarchy levels
+  unk_token:  "UNK"                  # fallback class for NaN / unseen values in val/test (replaces the old global-mode relabel at run_preprocessing.py:107)
+
+# ---------------------------------------------------------------------------
+# Training — defaults match the previous best model (seq2seq_ss.ipynb).
+# Override via the notebook's CONFIG cell or by editing here.
+# ---------------------------------------------------------------------------
+training:
+  embedding_strategy: "dummies"
+  sequence_length:    25
+  n_future:           8            # configurable; 15 ≈ 24 hours of ops
+  target_variables:
+    - phase_next
+    - phase_step_next
+    - major_ops_code_next
+    - operation_next
+    # - duration_next
+  enc_lstm_units: [128, 64]
+  dec_lstm_units: 128
+  dense_units:    [64]
+  dropout_rate:   0.3
+  dec_target_edims:
+    phase_next:          4
+    phase_step_next:     8
+    major_ops_code_next: 16
+    operation_next:      32
+  loss_weights:
+    phase_next:          0.2
+    phase_step_next:     0.3
+    major_ops_code_next: 1.0
+    operation_next:      2.0
+    duration_next:       1.5
+  ss_start_rate:  0.0
+  ss_end_rate:    0.75
+  ss_ramp_epochs: 200
+  batch_size:     64
+  epochs:         500
+  learning_rate:  0.0001       # initial LR; the dynamic-LR schedule below can drop it further
+  early_stopping_patience: 30
+  # ReduceLROnPlateau-style: halve LR when val_loss hasn't improved for `lr_patience`
+  # epochs, floored at `min_lr`. Set lr_patience to 0 to disable.
+  lr_patience: 10
+  lr_factor:   0.5
+  min_lr:      1.0e-7        # note: scientific notation in YAML needs the decimal point (`1.0e-7`, not `1e-7`) to parse as float
+  top_k_for_eval: 3                 # user wants top-3 accuracy reported alongside top-1
+  model_dir:      "models"          # parent dir; actual bundle goes to models/seq2seq_N{n}_K{k}_T{t}_{strategy}/ (see config.get_model_dir)
+  results_dir:    "results"
+
+# ---------------------------------------------------------------------------
+# LLM stage — controls which ML outputs are exposed to Claude and the API call
+# ---------------------------------------------------------------------------
+llm:
+  model: "claude-sonnet-4-6"
+  max_tokens: 8192
+  # Which ML-predicted fields to include in the prompt. ML predicts all 5 heads;
+  # removing entries here just hides them from the LLM — no retraining needed.
+  ml_fields_to_include:
+    - phase
+    - phase_step
+    - major_ops_code
+    # - operation
+    # - duration_hours
+  top_k_shown_to_llm: 3             # surface top-3 per step, matching training eval
+  similar_wells_top_k: 5
+  duration_tolerance_hours: 0.5      # allowed deviation from 24h sum
+  prompts_dir: "llm/prompts"
+  system_prompt_file: "system_prompt.md"
+  constraints_file:  "constraints.md"

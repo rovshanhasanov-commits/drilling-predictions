@@ -1,0 +1,72 @@
+# ---------------------------------------------------------------------------
+# Customer data — NEVER commit
+# ---------------------------------------------------------------------------
+# Raw / processed parquet + CSV data anywhere in the repo
+*.parquet
+*.csv
+*.pkl
+
+# Anything living under a "Data" folder, belt-and-suspenders
+Data/
+data/
+
+# Project-specific data folders
+misc/full_dataset.csv
+misc/*.csv
+misc/*.parquet
+
+# Generated model bundles and eval outputs (contain predictions/targets)
+models/
+results/
+
+# Keras weight files — these normally live under models/ but a stray
+# best_ss.weights.h5 can land in the repo root during a training run
+*.h5
+*.keras
+
+# Secrets / API keys
+.env
+.env.*
+!.env.example
+
+# ---------------------------------------------------------------------------
+# Python / notebook detritus
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Jupyter notebook cell outputs can embed data — either clear before commit
+# (jupyter nbconvert --clear-output --inplace) or audit manually.
+# We don't gitignore the notebooks themselves, but be aware.
+
+# ---------------------------------------------------------------------------
+# Personal scratch / working notes — useful locally, no reason to share
+# ---------------------------------------------------------------------------
+# NOTE on *.md: we deliberately do NOT blanket-exclude .md files because some are
+# code-critical (llm/prompts/system_prompt.md + constraints.md are loaded at
+# runtime) and the improvements/*.md design docs are cross-session references.
+# Exclude explicitly instead.
+/prompts.md
+/End to End Prediction prompt.md
+misc/exploration.md
+
+# ---------------------------------------------------------------------------
+# Analysis artifacts that contain data-derived outputs
+# ---------------------------------------------------------------------------
+# analysis.ipynb has executed cells with well names, counts, and per-op stats
+# baked into its output cells. If you want to share it, clear outputs first.
+misc/Improvement opportunities/analysis.ipynb
+# findings.json is a serialized dump of aggregated data findings.
+misc/Improvement opportunities/findings.json
+
+# ---------------------------------------------------------------------------
+# Editor / OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+.claude/
+.DS_Store
+Thumbs.db
+*.swp
