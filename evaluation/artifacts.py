@@ -85,14 +85,26 @@ def write_predictions_csv(
 ) -> Path:
     """One row per (sequence_idx, step). Large but grep-friendly.
 
-    When `tuple_topk_labels` is provided (constrained AR path), additional
-    columns `pred_tuple_{i}_{phase,phase_step,major_ops_code,operation}` +
-    `pred_tuple_{i}_logprob` (raw joint log-prob) + `pred_tuple_{i}_prob`
-    (renormalized over L, so one row's top-K probs sum to <= 1 and all-of-L
-    probs sum to exactly 1) are emitted for i in 0..K-1. The per-head
-    pred_{head}_top1 / pred_{head}_top3 columns stay populated (they come
-    from the coordinated tuple's first / top-K rows under constraints) so
-    downstream consumers don't break.
+    When `tuple_topk_labels` is provided (constrained AR path), adds two
+    groups of per-step columns:
+
+    1. Parsed per-head (for detail work):
+       - `pred_tuple_{i}_{phase,phase_step,major_ops_code,operation}`
+       - `pred_tuple_{i}_logprob` — raw joint log-prob (sum of 4 head log-probs)
+       - `pred_tuple_{i}_prob` — renormalized over L, so top-K sums to <= 1
+         and all-of-L sums to 1
+
+    2. Compact state (for analyst / Power BI / Excel):
+       - `true_state` — `phase|phase_step|major_ops_code|operation`
+       - `pred_{i}_state` — same format, for each top-K tuple
+       - `pred_{i}_state_prob` — same value as `pred_tuple_{i}_prob`, aliased
+         with the `state` naming for readability
+       - `pred_{i}_state_match` — bool, whether rank-i state equals true_state
+
+    Plus `tuple_in_topk` (bool) — did the ground-truth tuple appear anywhere
+    in the top-K. The per-head pred_{head}_top1 / pred_{head}_top3 columns
+    stay populated (they come from the coordinated tuple's first / top-K
+    rows under constraints) so existing downstream consumers don't break.
     """
     n, n_future = hierarchy_valid.shape
     have_tuples = tuple_topk_labels is not None and tuple_topk_logprob is not None
@@ -123,7 +135,14 @@ def write_predictions_csv(
             row["hierarchy_valid"] = bool(hierarchy_valid[seq, step])
 
             if have_tuples:
+                # Ground-truth state string (pipe-joined), when all 4 head labels are present.
+                true_state_parts = [true_labels[h][seq, step] for h in HIERARCHY if h in true_labels]
+                true_state = "|".join(true_state_parts) if len(true_state_parts) == 4 else None
+                if true_state is not None:
+                    row["true_state"] = true_state
+
                 for i in range(K_tuple):
+                    # Parsed per-head columns (kept for backward compat / detail work).
                     for j, h in enumerate(HIERARCHY):
                         row[f"pred_tuple_{i}_{h}"] = tuple_topk_labels[seq, step, i, j]
                     row[f"pred_tuple_{i}_logprob"] = round(
@@ -133,6 +152,19 @@ def write_predictions_csv(
                         row[f"pred_tuple_{i}_prob"] = round(
                             float(tuple_topk_prob[seq, step, i]), 4
                         )
+
+                    # Compact state-format columns (analyst-friendly for Power BI / Excel).
+                    pred_state = "|".join(
+                        str(tuple_topk_labels[seq, step, i, j]) for j in range(4)
+                    )
+                    row[f"pred_{i}_state"] = pred_state
+                    if tuple_topk_prob is not None:
+                        row[f"pred_{i}_state_prob"] = round(
+                            float(tuple_topk_prob[seq, step, i]), 4
+                        )
+                    if true_state is not None:
+                        row[f"pred_{i}_state_match"] = (pred_state == true_state)
+
                 # Did the ground-truth tuple appear in the top-K legal tuples?
                 true_tup = tuple(true_labels[h][seq, step] for h in HIERARCHY if h in true_labels)
                 if len(true_tup) == 4:

@@ -168,7 +168,10 @@ Writes to `results/{model_folder}/eval_{timestamp}/`:
 - `per_step_accuracy.csv` — tidy (head, mode, step) rows.
 - `confusion_{head}.csv` — top confused pairs per head.
 - `per_well_accuracy.csv` — per-well top-1 + duration MAE; detects domain shift across wells.
-- `predictions.csv` — one row per (sequence, step). Under constraints, includes `pred_tuple_{i}_{phase,phase_step,major_ops_code,operation}` + `pred_tuple_{i}_logprob` + `pred_tuple_{i}_prob` columns for i in 0..K-1, plus `tuple_in_topk` bool.
+- `predictions.csv` — one row per (sequence, step). Under constraints, includes:
+  - Parsed per-head: `pred_tuple_{i}_{phase,phase_step,major_ops_code,operation}` + `pred_tuple_{i}_logprob` + `pred_tuple_{i}_prob` for i in 0..K-1.
+  - Compact state-format (analyst-friendly): `true_state`, `pred_{i}_state`, `pred_{i}_state_prob`, `pred_{i}_state_match` — `state` is `phase|phase_step|major_ops_code|operation` pipe-joined; `match` is bool.
+  - `tuple_in_topk` bool — did ground-truth tuple appear anywhere in the top-K.
 - `run_config.json` — CLI args + frozen model_config for reproducibility.
 
 Then open [evaluation/eval_report.ipynb](evaluation/eval_report.ipynb) (runs in
