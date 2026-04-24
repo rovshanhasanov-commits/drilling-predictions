@@ -18,7 +18,7 @@ import numpy as np
 
 from config import get_model_dir, load_config, resolve
 
-from .contract import HierarchyTuple, MLOutput, StepPrediction
+from .contract import DurationBin, HierarchyTuple, MLOutput, StepPrediction
 from .load import load_bundle
 from .preprocess_selection import build_encoder_input
 
@@ -28,12 +28,14 @@ HIERARCHY = ["phase", "phase_step", "major_ops_code", "operation"]
 _CACHED_BUNDLE = None
 
 
-def _get_bundle(model_dir: Path, strategy_dir: Path):
+def _get_bundle(model_dir: Path, strategy_dir: Path, include_bins: bool = False):
     global _CACHED_BUNDLE
-    cache_key = (str(model_dir), str(strategy_dir))
+    # Cache key includes include_bins so flipping the yaml flag rebuilds the
+    # 5D legal-tuple table on the next call without restarting the process.
+    cache_key = (str(model_dir), str(strategy_dir), bool(include_bins))
     if _CACHED_BUNDLE is not None and _CACHED_BUNDLE["_key"] == cache_key:
         return _CACHED_BUNDLE
-    bundle = load_bundle(model_dir, strategy_dir=strategy_dir)
+    bundle = load_bundle(model_dir, strategy_dir=strategy_dir, include_bins=include_bins)
     bundle["_key"] = cache_key
     _CACHED_BUNDLE = bundle
     return bundle
@@ -67,8 +69,20 @@ def predict(
     k = (top_k if top_k is not None
          else icfg.get("top_k_tuples", tcfg.get("top_k_for_eval", 3)))
     enforce_hierarchy = bool(icfg.get("enforce_hierarchy", True))
+    include_bins_in_hierarchy = bool(icfg.get("include_duration_bins_in_hierarchy", False))
 
-    bundle = _get_bundle(model_dir, strategy_dir)
+    active_targets = [t.replace("_next", "") for t in tcfg["target_variables"] if t != "duration_next"]
+    predict_duration = "duration_next" in tcfg["target_variables"]
+    has_bin_head = "duration_bin" in active_targets
+
+    if include_bins_in_hierarchy and not has_bin_head:
+        raise ValueError(
+            "inference.include_duration_bins_in_hierarchy=true requires "
+            "duration_bin_next in training.target_variables."
+        )
+
+    use_5d = enforce_hierarchy and include_bins_in_hierarchy
+    bundle = _get_bundle(model_dir, strategy_dir, include_bins=use_5d)
     encoder_model = bundle["encoder_model"]
     decoder_step_model = bundle["decoder_step_model"]
     encoders = bundle["encoders"]
@@ -76,6 +90,7 @@ def predict(
     n_classes = encoders["n_classes"]
     target_encoders = encoders["target_encoders"]
     dur_scaler = encoders["dur_scaler"]
+    bin_centers = encoders.get("bin_centers") or {}
     legal_tuples = bundle.get("legal_tuples") if enforce_hierarchy else None
 
     if enforce_hierarchy and legal_tuples is None:
@@ -83,9 +98,6 @@ def predict(
         # per-head argmax rather than silently drop hierarchy guarantees.
         print("[inference] enforce_hierarchy=True but legal_tuples unavailable; "
               "falling back to unconstrained decoding")
-
-    active_targets = [t.replace("_next", "") for t in tcfg["target_variables"] if t != "duration_next"]
-    predict_duration = "duration_next" in tcfg["target_variables"]
 
     if legal_tuples is not None:
         missing = [h for h in HIERARCHY if h not in active_targets]
@@ -104,6 +116,9 @@ def predict(
     prev_dur = np.array([[0.0]], dtype=np.float32) if predict_duration else None
 
     steps_out: list[StepPrediction] = []
+    bin_classes = (list(target_encoders["duration_bin"].classes_)
+                   if has_bin_head else [])
+    sentinel_top1_count = 0
 
     for step in range(n_future):
         dec_step_in = [prev_cat[t] for t in active_targets]
@@ -126,16 +141,38 @@ def predict(
         h = step_out[idx]
         c = step_out[idx + 1]
 
+        # Bin-head top-K (independent of the joint argmax). When 5D mode is on,
+        # the joint argmax also chooses a bin and writes it onto each
+        # HierarchyTuple; this independent top-K is still surfaced for the LLM /
+        # UI debug view.
+        duration_bin_topk: list[DurationBin] = []
+        if has_bin_head:
+            bin_probs = level_probs["duration_bin"]
+            bin_order = np.argsort(-bin_probs)[:k]
+            duration_bin_topk = [
+                DurationBin(
+                    label=str(bin_classes[bid]),
+                    prob=float(bin_probs[bid]),
+                    center_hours=float(bin_centers.get(str(bin_classes[bid]),
+                                                       float("nan"))),
+                )
+                for bid in bin_order
+            ]
+
         if legal_tuples is not None:
             # Batch-dim = 1; joint_topk_tuples expects (B, n_classes) per head.
-            probs_batched = {t: level_probs[t][None, :] for t in HIERARCHY}
+            head_names_joint = HIERARCHY + (["duration_bin"] if use_5d else [])
+            probs_batched = {t: level_probs[t][None, :] for t in head_names_joint}
             from training.constraints import joint_topk_tuples       # local to dodge TF import cost at module load
-            tk_tuples, tk_log_probs, tk_probs = joint_topk_tuples(probs_batched, legal_tuples, k)
-            tk_tuples    = tk_tuples[0]                              # (K, 4)
+            tk_tuples, tk_log_probs, tk_probs = joint_topk_tuples(
+                probs_batched, legal_tuples, k, head_names=head_names_joint,
+            )
+            tk_tuples    = tk_tuples[0]                              # (K, n_joint)
             tk_log_probs = tk_log_probs[0]                           # (K,)
             tk_probs     = tk_probs[0]                               # (K,) renormalized over L
-            topk_tuples = [
-                HierarchyTuple(
+            topk_tuples = []
+            for i in range(tk_tuples.shape[0]):
+                tup_kwargs = dict(
                     phase          = str(target_encoders["phase"].classes_[tk_tuples[i, 0]]),
                     phase_step     = str(target_encoders["phase_step"].classes_[tk_tuples[i, 1]]),
                     major_ops_code = str(target_encoders["major_ops_code"].classes_[tk_tuples[i, 2]]),
@@ -143,11 +180,21 @@ def predict(
                     log_prob       = float(tk_log_probs[i]),
                     prob           = float(tk_probs[i]),
                 )
-                for i in range(tk_tuples.shape[0])
-            ]
+                if use_5d:
+                    tup_kwargs["duration_bin"] = str(
+                        target_encoders["duration_bin"].classes_[tk_tuples[i, 4]]
+                    )
+                topk_tuples.append(HierarchyTuple(**tup_kwargs))
             # Feedback = winning tuple's ids (not independent argmaxes).
-            for i, t in enumerate(HIERARCHY):
+            for i, t in enumerate(head_names_joint):
                 prev_cat[t] = np.array([[int(tk_tuples[0, i])]], dtype=np.int32)
+            # Bin head feedback under 4D constraints: independent argmax (joint
+            # didn't choose a bin). Without this, prev_cat["duration_bin"]
+            # would never advance and the bin head would condition on the
+            # start-token forever.
+            if has_bin_head and not use_5d:
+                bin_top1_id = int(np.argmax(level_probs["duration_bin"]))
+                prev_cat["duration_bin"] = np.array([[bin_top1_id]], dtype=np.int32)
         else:
             # Unconstrained fallback: independent per-head argmax, top-K per head.
             # The surfaced tuples here are NOT guaranteed legal — but they match
@@ -174,17 +221,40 @@ def predict(
                 ))
             for t in HIERARCHY:
                 prev_cat[t] = np.array([[int(order[t][0])]], dtype=np.int32)
+            if has_bin_head:
+                bin_top1_id = int(np.argmax(level_probs["duration_bin"]))
+                prev_cat["duration_bin"] = np.array([[bin_top1_id]], dtype=np.int32)
 
-        duration_hours = (
-            float(_invert_duration(np.array([dur_scaled]), dur_scaler)[0])
-            if (predict_duration and dur_scaled is not None)
-            else 0.0
-        )
+        # duration_hours sourcing:
+        # - regression head on  -> inverse-transform of its scalar
+        # - bin head on (only)  -> top-1 bin's center; sentinels collapse to 0.0
+        # - both off            -> 0.0 (legacy behavior)
+        if predict_duration and dur_scaled is not None:
+            duration_hours = float(_invert_duration(np.array([dur_scaled]), dur_scaler)[0])
+        elif has_bin_head and duration_bin_topk:
+            top1_bin = duration_bin_topk[0]
+            if top1_bin.center_hours == top1_bin.center_hours:   # not NaN -> real bin
+                duration_hours = float(top1_bin.center_hours)
+            else:
+                # Sentinel predicted (Unplanned / UNK); render as 0.0 so the
+                # 24h-sum indicator stays meaningful. EOO has center 0.0 so it
+                # naturally falls into the real-bin branch above.
+                sentinel_top1_count += 1
+                duration_hours = 0.0
+        else:
+            duration_hours = 0.0
+
         steps_out.append(StepPrediction(
             step=step,
             topk_tuples=topk_tuples,
             duration_hours=duration_hours,
+            duration_bin_topk=duration_bin_topk,
         ))
+
+    if has_bin_head and sentinel_top1_count > 0:
+        print(f"[inference] bin top-1 was a sentinel (Unplanned/UNK) on "
+              f"{sentinel_top1_count}/{n_future} steps; duration_hours set to 0.0 "
+              f"for those steps.")
 
     report_date_obj = (
         report_date if isinstance(report_date, date)

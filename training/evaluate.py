@@ -71,6 +71,7 @@ def autoregressive_predict(
     batch_size: int = 256,
     top_k: int = 3,
     legal_tuples: np.ndarray | None = None,
+    include_bins: bool = False,
 ):
     """Autoregressive decode. Returns per-target arrays:
         - 'pred[head]':        (batch, N_future)            argmax / joint-argmax predictions
@@ -78,12 +79,12 @@ def autoregressive_predict(
         - 'topk_probs[head]':  (batch, N_future, top_k)     corresponding probs
         - 'duration' (if predict_duration): (batch, N_future)
 
-    When `legal_tuples` is provided (shape (num_legal, 4), int32):
+    When `legal_tuples` is provided (shape (num_legal, D), int32):
         - Per-step argmax becomes joint argmax over the legal-tuple table.
         - `topk` + `topk_probs` are still populated (per-head ranks unchanged)
           so legacy callers work, but the result dict also includes:
-            - 'tuple_pred':          (batch, N_future, 4)     chosen legal tuple per step
-            - 'tuple_topk':          (batch, N_future, K, 4)  top-K legal tuples per step
+            - 'tuple_pred':          (batch, N_future, D)     chosen legal tuple per step
+            - 'tuple_topk':          (batch, N_future, K, D)  top-K legal tuples per step
             - 'tuple_topk_logprob':  (batch, N_future, K)     raw joint log-probs
             - 'tuple_topk_prob':     (batch, N_future, K)     probabilities
                                                               RENORMALIZED over all legal
@@ -91,6 +92,9 @@ def autoregressive_predict(
                                                               sum over just top-K <= 1).
         - The winning tuple's class ids feed back as next-step decoder inputs —
           this is what prevents mid-sequence drift (vs. independent per-head argmax).
+        - With `include_bins=True`, D=5 and the bin head joins the joint argmax
+          as the 5th column. Default `include_bins=False`, D=4 (4-hierarchy
+          tuples; the bin head, if active, feeds back via independent argmax).
     """
     use_constraints = legal_tuples is not None
     if use_constraints:
@@ -99,6 +103,17 @@ def autoregressive_predict(
             raise ValueError(
                 f"legal_tuples requires all 4 hierarchy heads in active_targets; missing {missing}"
             )
+    if include_bins:
+        if not use_constraints:
+            raise ValueError("include_bins=True requires legal_tuples to be provided")
+        if "duration_bin" not in active_targets:
+            raise ValueError(
+                "include_bins=True requires 'duration_bin' in active_targets "
+                "(set duration_bin_next in target_variables)"
+            )
+
+    head_names_joint = HIERARCHY + (["duration_bin"] if include_bins else [])
+    n_joint_heads = len(head_names_joint)
 
     n_samples = enc_X[0].shape[0]
     enc_out, h, c = encoder_model.predict(enc_X, batch_size=batch_size, verbose=0)
@@ -111,8 +126,8 @@ def autoregressive_predict(
 
     if use_constraints:
         K_tuple = min(int(top_k), int(legal_tuples.shape[0]))
-        tuple_pred          = np.zeros((n_samples, n_future, 4), dtype=np.int32)
-        tuple_topk          = np.zeros((n_samples, n_future, K_tuple, 4), dtype=np.int32)
+        tuple_pred          = np.zeros((n_samples, n_future, n_joint_heads), dtype=np.int32)
+        tuple_topk          = np.zeros((n_samples, n_future, K_tuple, n_joint_heads), dtype=np.int32)
         tuple_topk_logprob  = np.zeros((n_samples, n_future, K_tuple), dtype=np.float32)
         tuple_topk_prob     = np.zeros((n_samples, n_future, K_tuple), dtype=np.float32)
 
@@ -140,16 +155,27 @@ def autoregressive_predict(
             idx += 1
 
         if use_constraints:
-            # Joint top-K first (argmax = top-1).
-            tk_tuples, tk_log_probs, tk_probs = joint_topk_tuples(step_probs, legal_tuples, K_tuple)
+            # Joint top-K first (argmax = top-1). Score sums over `head_names_joint`
+            # — 4 hierarchy heads, plus the bin head when include_bins=True.
+            tk_tuples, tk_log_probs, tk_probs = joint_topk_tuples(
+                step_probs, legal_tuples, K_tuple, head_names=head_names_joint,
+            )
             tuple_topk[:, step, :, :]       = tk_tuples
             tuple_topk_logprob[:, step, :]  = tk_log_probs
             tuple_topk_prob[:, step, :]     = tk_probs
-            chosen = tk_tuples[:, 0, :]                          # (batch, 4)
+            chosen = tk_tuples[:, 0, :]                          # (batch, n_joint_heads)
             tuple_pred[:, step, :] = chosen
-            for i, t in enumerate(HIERARCHY):
+            for i, t in enumerate(head_names_joint):
                 preds[t][:, step] = chosen[:, i]
                 prev_cat[t] = chosen[:, i:i + 1]                 # feedback
+            # Heads not in the joint table (e.g. bin head when include_bins=False)
+            # fall back to independent argmax. Without this loop, preds["duration_bin"]
+            # would silently stay all zeros when the bin head is active in 4D mode.
+            for t in active_targets:
+                if t not in head_names_joint:
+                    pred_cls = step_probs[t].argmax(axis=-1)
+                    preds[t][:, step] = pred_cls
+                    prev_cat[t] = pred_cls.reshape(-1, 1)
         else:
             for t in active_targets:
                 pred_cls = step_probs[t].argmax(axis=-1)

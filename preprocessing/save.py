@@ -24,6 +24,9 @@ def save_strategy(
     test_wells: set,
     eoo_token: str,
     split_cfg: dict,
+    bin_labels: list[str] | None = None,
+    bin_edges: list[float] | None = None,
+    bin_centers: dict[str, float] | None = None,
 ):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -32,15 +35,20 @@ def save_strategy(
     df_val.to_parquet(out_dir / "df_val.parquet", index=False)
     df_test.to_parquet(out_dir / "df_test.parquet", index=False)
 
+    encoders_payload = {
+        "cat_encoders": cat_encoders,
+        "target_encoders": target_encoders,
+        "n_classes": n_classes,
+        "feat_scaler": feat_scaler,
+        "dur_scaler": dur_scaler,
+        "eoo_token": eoo_token,
+    }
+    if bin_labels is not None:
+        encoders_payload["bin_labels"]  = list(bin_labels)
+        encoders_payload["bin_edges"]   = list(bin_edges) if bin_edges is not None else None
+        encoders_payload["bin_centers"] = dict(bin_centers) if bin_centers is not None else None
     with open(out_dir / "encoders.pkl", "wb") as f:
-        pickle.dump({
-            "cat_encoders": cat_encoders,
-            "target_encoders": target_encoders,
-            "n_classes": n_classes,
-            "feat_scaler": feat_scaler,
-            "dur_scaler": dur_scaler,
-            "eoo_token": eoo_token,
-        }, f)
+        pickle.dump(encoders_payload, f)
 
     config = {
         "strategy": strategy,
@@ -62,6 +70,10 @@ def save_strategy(
         # target vocab is implicit in target_encoders; names reproduced for clarity
         "target_cols": ["phase", "phase_step", "major_ops_code", "operation"],
     }
+    if bin_labels is not None:
+        config["duration_bin_n_classes"] = len(bin_labels) + 3
+        config["bin_labels_order"] = list(bin_labels) + ["EOO", "Unplanned", "UNK"]
+        config["bin_edges"] = list(bin_edges) if bin_edges is not None else None
     with open(out_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2, default=str)
 

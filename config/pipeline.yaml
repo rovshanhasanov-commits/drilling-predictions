@@ -71,6 +71,19 @@ preprocessing:
     - SFTY_NPT
   unplanned_token: "Unplanned"
 
+  # Duration binning — see improvements/Duration Binning.md.
+  # `enabled: true` materializes a `duration_bin` column on every split + fits
+  # a bin LabelEncoder + computes empirical bin centers. Whether a model
+  # *trains* on it is governed separately by `training.target_variables`
+  # (include `duration_bin_next` to turn the head on).
+  # Edges are right-inclusive (DAX-style): 0.25 lands in `≤0.25 hr`, 0.251 in
+  # `0.25-0.5 hr`. Sentinels EOO / Unplanned / UNK are auto-appended.
+  duration_bins:
+    enabled: true
+    edges:  [0.25, 0.5, 1.0, 2.0, 5.0, 10.0]
+    labels: ["≤0.25 hr", "0.25-0.5 hr", "0.5-1 hr",
+             "1-2 hrs", "2-5 hrs", "5-10 hrs", "10+ hrs"]
+
 # ---------------------------------------------------------------------------
 # Feature selection — the subset of Comment_Features to keep as model inputs.
 # Edit freely: preprocessing/features.py reads this list and ignores all others.
@@ -126,12 +139,16 @@ training:
   embedding_strategy: "dummies"
   sequence_length:    25
   n_future:           8            # configurable; 15 ≈ 24 hours of ops
+  # Exactly one of `duration_next` / `duration_bin_next` should be active per
+  # training run. Both can technically coexist (warn-but-allow); regression
+  # wins for StepPrediction.duration_hours when both are on.
   target_variables:
     - phase_next
     - phase_step_next
     - major_ops_code_next
     - operation_next
     # - duration_next
+    - duration_bin_next
   enc_lstm_units: [128, 64]
   dec_lstm_units: 128
   dense_units:    [64]
@@ -141,13 +158,15 @@ training:
     phase_step_next:     8
     major_ops_code_next: 16
     operation_next:      32
+    duration_bin_next:   8       # 10 classes (7 bins + 3 sentinels) embed in 8 dims
   loss_weights:
     phase_next:          0.2
     phase_step_next:     0.3
     major_ops_code_next: 1.0
     operation_next:      2.0
     duration_next:       1.5
-  ss_start_rate:  0.0
+    duration_bin_next:   1.0     # tunable; CE loss for the bin classification head
+  ss_start_rate:  0.3
   ss_end_rate:    0.75
   ss_ramp_epochs: 200
   batch_size:     64
@@ -156,7 +175,7 @@ training:
   early_stopping_patience: 30
   # ReduceLROnPlateau-style: halve LR when val_loss hasn't improved for `lr_patience`
   # epochs, floored at `min_lr`. Set lr_patience to 0 to disable.
-  lr_patience: 10
+  lr_patience: 1
   lr_factor:   0.5
   min_lr:      1.0e-7        # note: scientific notation in YAML needs the decimal point (`1.0e-7`, not `1e-7`) to parse as float
   top_k_for_eval: 3                 # user wants top-3 accuracy reported alongside top-1
@@ -173,6 +192,12 @@ training:
 inference:
   enforce_hierarchy: true      # joint argmax over legal tuples; false = unconstrained per-head argmax
   top_k_tuples:     3          # how many legal tuples to surface per step (MLOutput + LLM prompt)
+  # When true, the bin head joins the legal-tuple constraint as a 5th column —
+  # legal tuples become (phase, phase_step, major_ops_code, operation, duration_bin).
+  # Requires `duration_bin_next` in `training.target_variables` (validated at load).
+  # Default false: predict bin head independently first, decide on coupling once
+  # bin top-1 / top-3 numbers are in.
+  include_duration_bins_in_hierarchy: true
 
 # ---------------------------------------------------------------------------
 # LLM stage — controls which ML outputs are exposed to Claude and the API call

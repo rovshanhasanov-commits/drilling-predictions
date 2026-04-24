@@ -34,7 +34,19 @@ def build_seq2seq_model(
     predict_duration: bool,
     dec_target_edims: dict,
 ):
-    """Returns (training_model, encoder_model, decoder_step_model)."""
+    """Returns (training_model, encoder_model, decoder_step_model).
+
+    The bin classification head (`"duration_bin"` in `active_targets`) flows
+    through the same per-head categorical loop as the 4 hierarchy heads — same
+    embedding-input + softmax-output pattern, same scheduled-sampling treatment.
+    Place it AFTER the 4 hierarchy heads in `active_targets` so the order of
+    decoder inputs and step-outputs is stable.
+    """
+
+    if predict_duration and "duration_bin" in active_targets:
+        print("[warn] both duration heads active in target_variables; "
+              "regression head populates StepPrediction.duration_hours; "
+              "bin head's top-K is surfaced separately.")
 
     ENC_SEPARATE_EDIMS = {
         "phase_enc": 4, "phase_step_enc": 8,

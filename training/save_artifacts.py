@@ -1,6 +1,7 @@
 """Save the trained model bundle in the layout expected by inference/load.py."""
 
 import json
+import pickle
 import shutil
 from pathlib import Path
 
@@ -22,6 +23,17 @@ def save_bundle(
 
     shutil.copy(Path(strategy_data_dir) / "encoders.pkl", model_dir / "encoders.pkl")
     shutil.copy(Path(strategy_data_dir) / "config.json",  model_dir / "data_config.json")
+
+    # Augment model_config with bin_edges pulled from encoders.pkl so the
+    # inference load-time staleness check has a single source of truth in the
+    # model bundle. Doesn't mutate the caller's dict.
+    model_config = dict(model_config)
+    enc_path = Path(strategy_data_dir) / "encoders.pkl"
+    if enc_path.exists():
+        with open(enc_path, "rb") as f:
+            enc = pickle.load(f)
+        if enc.get("bin_edges") is not None:
+            model_config["bin_edges"] = list(enc["bin_edges"])
 
     with open(model_dir / "model_config.json", "w") as f:
         json.dump(model_config, f, indent=2, default=str)

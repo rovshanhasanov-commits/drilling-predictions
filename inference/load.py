@@ -15,15 +15,23 @@ from pathlib import Path
 import numpy as np
 
 
-def load_bundle(model_dir: str | Path, strategy_dir: str | Path | None = None):
+def load_bundle(
+    model_dir: str | Path,
+    strategy_dir: str | Path | None = None,
+    include_bins: bool = False,
+):
     """Returns a dict with the model graphs, encoders, configs, and (optionally)
     a legal-tuple table for constrained decoding.
 
     Keys:
         encoder_model, decoder_step_model, training_model,
         encoders, data_config, model_config,
-        legal_tuples   -- np.ndarray (num_legal, 4) int32, or None if strategy_dir not passed
-                          or the parquets are unavailable.
+        legal_tuples   -- np.ndarray (num_legal, 4 or 5) int32, or None if
+                          strategy_dir not passed or the parquets are unavailable.
+
+    `include_bins=True` rebuilds the legal-tuple table with the bin head as the
+    5th column (requires the bundle to have been trained with the bin head; we
+    assert this against the bundle's `target_encoders` to fail loudly).
     """
     import tensorflow as tf  # local import so CLI tools that don't need TF don't pay startup
 
@@ -46,9 +54,31 @@ def load_bundle(model_dir: str | Path, strategy_dir: str | Path | None = None):
     with open(model_dir / "model_config.json", "r") as f:
         model_config = json.load(f)
 
+    # Bundle-self-consistency check: model_config carries bin_edges (injected
+    # by training.save_artifacts.save_bundle from encoders.pkl at training
+    # time). If the two disagree, someone hand-edited one of the files —
+    # silent mismatch would mean the model's softmax classes correspond to a
+    # different bin definition than what `bin_centers` / `bin_labels` claim.
+    cfg_edges = model_config.get("bin_edges")
+    enc_edges = encoders.get("bin_edges")
+    if cfg_edges is not None and enc_edges is not None and list(cfg_edges) != list(enc_edges):
+        raise ValueError(
+            f"Stale bundle: model_config.json bin_edges {cfg_edges} != "
+            f"encoders.pkl bin_edges {enc_edges}. Retrain or restore one of "
+            f"the files to match."
+        )
+
+    if include_bins and "duration_bin" not in encoders.get("target_encoders", {}):
+        raise ValueError(
+            "include_duration_bins_in_hierarchy=true but bundle was trained "
+            "without the bin head (encoders.pkl has no `duration_bin` encoder). "
+            "Retrain with duration_bin_next in target_variables, or set the "
+            "flag to false."
+        )
+
     legal_tuples = None
     if strategy_dir is not None:
-        legal_tuples = _load_legal_tuples(strategy_dir, encoders)
+        legal_tuples = _load_legal_tuples(strategy_dir, encoders, include_bins=include_bins)
 
     return {
         "encoder_model":      encoder_model,
@@ -61,7 +91,11 @@ def load_bundle(model_dir: str | Path, strategy_dir: str | Path | None = None):
     }
 
 
-def _load_legal_tuples(strategy_dir: str | Path, encoders: dict) -> np.ndarray | None:
+def _load_legal_tuples(
+    strategy_dir: str | Path,
+    encoders: dict,
+    include_bins: bool = False,
+) -> np.ndarray | None:
     """Rebuild L from the cleaned parquet splits. Returns None if parquets are missing."""
     import pandas as pd
 
@@ -85,7 +119,9 @@ def _load_legal_tuples(strategy_dir: str | Path, encoders: dict) -> np.ndarray |
         dfs["df_train"], dfs["df_val"], dfs["df_test"],
         encoders["target_encoders"],
         eoo_token=encoders.get("eoo_token", "End of Operations"),
+        include_bins=include_bins,
     )
     stats = summarize_legal_tuples(L, encoders["target_encoders"])
-    print(f"  [legal_tuples] {stats}")
+    suffix = " (5D, bin head joins joint argmax)" if include_bins else ""
+    print(f"  [legal_tuples]{suffix} {stats}")
     return L

@@ -24,6 +24,11 @@ SAMPLE_WEIGHT_MAP: list[tuple[str, str]] = [
     ("op_label_real",  "operation"),
     ("moc_label_real", "major_ops_code"),
     ("dur_label_real", "duration"),
+    # `duration_bin` shares the same row-level mask as the regression head:
+    # Unplanned / NaN-op rows train neither head. Both mappings stay
+    # unconditionally — _expand_sample_weight skips heads not in y_fit, so the
+    # unused mapping is harmless when only one duration head is active.
+    ("dur_label_real", "duration_bin"),
 ]
 
 
@@ -150,11 +155,20 @@ def build_seq2seq_sequences(
 
 
 def eoo_encoded_ids(target_encoders: dict, eoo_token: str) -> dict:
-    """Return {'phase_target_enc': int, ...} for EOO in each level."""
+    """Return {'phase_target_enc': int, ...} for EOO in each level.
+
+    When the bin encoder is present (`"duration_bin" in target_encoders`), also
+    emits `duration_bin_target_enc` -> id of the bin "EOO" sentinel class. The
+    bin head's EOO label is the literal string "EOO", not the 4-hierarchy-head
+    `eoo_token` ("End of Operations") — see preprocessing/bins.py.
+    """
     out = {}
     for level in HIERARCHY:
         classes = list(target_encoders[level].classes_)
         out[f"{level}_target_enc"] = classes.index(eoo_token)
+    if "duration_bin" in target_encoders:
+        bin_classes = list(target_encoders["duration_bin"].classes_)
+        out["duration_bin_target_enc"] = bin_classes.index("EOO")
     return out
 
 

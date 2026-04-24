@@ -136,6 +136,58 @@ def duration_metrics(
 
 
 # ---------------------------------------------------------------------------
+# Duration bin (classification head)
+# ---------------------------------------------------------------------------
+
+def bin_center_mae(
+    pred_bin_ids: np.ndarray,
+    true_hours: np.ndarray,
+    bin_centers: dict,
+    bin_classes: list[str],
+    weights: np.ndarray | None = None,
+    long_threshold: float | None = 8.0,
+) -> dict:
+    """MAE in hours between top-1 bin's center and true raw `Duration hours`.
+
+    Cross-compatible companion to `duration_metrics()` so the same eval report
+    can carry numbers from either the bin head or the regression head.
+
+    Skips:
+      - rows where `weights` (if given) has weight <= 0 (Unplanned / UNK / NaN-dur masked)
+      - rows where the predicted bin's center is NaN (sentinel predicted —
+        EOO has center 0.0 and IS counted; Unplanned/UNK have NaN centers
+        and are NOT counted, since "hours" doesn't apply)
+    """
+    pred = pred_bin_ids.flatten()
+    true = true_hours.flatten()
+
+    centers_arr = np.asarray(
+        [bin_centers.get(c, float("nan")) for c in bin_classes], dtype=np.float64
+    )
+    pred_centers = centers_arr[pred]
+
+    keep = np.isfinite(pred_centers)
+    if weights is not None:
+        keep &= (weights.flatten() > 0)
+    if not keep.any():
+        return {"bin_center_mae_hours": float("nan"),
+                "bin_center_mae_long_hours": float("nan")}
+
+    err = np.abs(pred_centers[keep] - true[keep])
+    out = {"bin_center_mae_hours": float(err.mean())}
+
+    if long_threshold is not None:
+        long_keep = keep & (true > float(long_threshold))
+        if long_keep.any():
+            out["bin_center_mae_long_hours"] = float(
+                np.abs(pred_centers[long_keep] - true[long_keep]).mean()
+            )
+        else:
+            out["bin_center_mae_long_hours"] = float("nan")
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Confusion pairs
 # ---------------------------------------------------------------------------
 

@@ -35,6 +35,14 @@ is usually right, but occasionally the right answer is rank-2 or rank-3
 when the model is torn between similar plausible next-op sequences. Use
 your domain reasoning to pick the best candidate per step.
 
+**Duration bins (when shown).** Some runs include a `Dur_bin_topK`
+column on each step's rank-1 row: the bin classification head's top-K
+duration-range candidates with probabilities, e.g. `1-2 hrs (0.47) | 2-5 hrs (0.31)`.
+Bins are right-inclusive (e.g. `0.25-0.5 hr` includes 0.5 but not 0.25).
+Treat the top-1 bin as your range and pick a specific duration inside
+it informed by Context 2's similar wells. Ignore sentinel bins (`EOO`,
+`Unplanned`, `UNK`) when picking a value — they are not durations.
+
 **Important about the ML output**: if a step has `End of Operations` in
 the top-K, that's a real class the model emits when the well's
 operational sequence is over. If the well is clearly still active,

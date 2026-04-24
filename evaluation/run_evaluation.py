@@ -96,8 +96,20 @@ def main():
     seq_len = tcfg["sequence_length"]
     n_future = tcfg["n_future"]
     top_k = tcfg.get("top_k_for_eval", 3)
+    # active_targets strips "_next" and excludes the regression head (which is
+    # plumbed via predict_duration). The bin classification head ("duration_bin")
+    # flows through as another categorical target when present in target_variables.
     active_targets = [t.replace("_next", "") for t in tcfg["target_variables"] if t != "duration_next"]
     predict_duration = "duration_next" in tcfg["target_variables"]
+    has_bin_head = "duration_bin" in active_targets
+
+    include_bins_in_hierarchy = bool(icfg.get("include_duration_bins_in_hierarchy", False))
+    if include_bins_in_hierarchy and not has_bin_head:
+        raise ValueError(
+            "inference.include_duration_bins_in_hierarchy=true requires "
+            "duration_bin_next in training.target_variables. Either enable the bin "
+            "head or set the flag to false."
+        )
 
     # -- load all splits once: the chosen split drives eval, the union drives L --
     split_bundle = load_strategy_data(strategy_dir)
@@ -107,14 +119,17 @@ def main():
     # Legal-tuple table from train ∪ val ∪ test (treated as SME domain knowledge,
     # not a leakage surface — see improvements/Constraint Decoder.md).
     enforce_hierarchy = (not args.no_constraints) and icfg.get("enforce_hierarchy", True)
+    use_5d_constraints = enforce_hierarchy and include_bins_in_hierarchy
     legal_tuples = None
     if enforce_hierarchy:
         legal_tuples = build_legal_tuples(
             split_bundle["df_train"], split_bundle["df_val"], split_bundle["df_test"],
             target_encoders, eoo_token=eoo_token,
+            include_bins=use_5d_constraints,
         )
         stats = summarize_legal_tuples(legal_tuples, target_encoders)
-        print(f"Legal tuples: {stats}")
+        mode_str = "5D (bin head joins joint argmax)" if use_5d_constraints else "4D"
+        print(f"Legal tuples ({mode_str}): {stats}")
     else:
         print("Constraints disabled (--no-constraints or inference.enforce_hierarchy=false)")
 
@@ -128,6 +143,8 @@ def main():
     cat_input_cols = data_config["cat_input_cols"]
     numeric_cols = compute_numeric_cols(data_config)
     target_cols = [f"{h}_target_enc" for h in HIERARCHY]
+    if has_bin_head:
+        target_cols.append("duration_bin_target_enc")
 
     eoo_enc = eoo_encoded_ids(target_encoders, eoo_token)
     eoo_dur = eoo_duration_value(dur_scaler)
@@ -175,11 +192,13 @@ def main():
         print(f"  TF {h:20s}  top1={tf_scores[h]['overall_top1']:.4f}  top{top_k}={tf_scores[h]['overall_topk']:.4f}")
 
     # -- autoregressive predictions (deployment; constrained when legal_tuples is set) --
-    print(f"Running autoregressive predictions (constraints={'on' if enforce_hierarchy else 'off'})...")
+    print(f"Running autoregressive predictions (constraints={'on' if enforce_hierarchy else 'off'}"
+          f"{', 5D' if use_5d_constraints else ''})...")
     ar = autoregressive_predict(
         encoder_model, decoder_step_model, enc_X, n_future, n_classes,
         active_targets, predict_duration, batch_size=args.batch_size, top_k=top_k,
         legal_tuples=legal_tuples,
+        include_bins=use_5d_constraints,
     )
     ar_pred_ids = ar["pred"]                         # {head: (n, n_future)}
     ar_topk_ids = ar["topk"]                         # {head: (n, n_future, top_k)}
@@ -253,16 +272,26 @@ def main():
     tuple_topk_logprob = None
     tuple_topk_prob = None
     if enforce_hierarchy and "tuple_topk" in ar:
-        tk = ar["tuple_topk"]                          # (n, n_future, K, 4), ids
+        tk = ar["tuple_topk"]                          # (n, n_future, K, n_joint_heads), ids
         tuple_topk_labels = np.empty(tk.shape, dtype=object)
         for i, h in enumerate(HIERARCHY):
             tuple_topk_labels[..., i] = _decode_ids(tk[..., i], target_encoders[h])
+        if use_5d_constraints:
+            # Last column is the bin head; decode through the bin encoder.
+            tuple_topk_labels[..., 4] = _decode_ids(tk[..., 4], target_encoders["duration_bin"])
         tuple_topk_logprob = ar["tuple_topk_logprob"]  # (n, n_future, K) raw joint log-probs
         tuple_topk_prob    = ar["tuple_topk_prob"]     # (n, n_future, K) renormalized over L
 
     # -- duration (inverse-transform to hours) --
-    if predict_duration:
+    # Always compute true_duration in raw hours when the bin head is on, so the
+    # bin-center MAE has a real reference even when the regression head is off.
+    need_true_hours = predict_duration or has_bin_head
+    if need_true_hours:
         true_duration = _invert_duration(seq["y_dur"], dur_scaler)
+    else:
+        true_duration = np.zeros_like(seq["y_dur"])
+
+    if predict_duration:
         pred_duration = _invert_duration(ar["pred"]["duration"], dur_scaler)
         dur_stats = metrics.duration_metrics(pred_duration, true_duration, weights=sw.get("duration"))
         print(
@@ -270,9 +299,22 @@ def main():
             f"MedAE={dur_stats['medae_hours']:.2f}h  p95={dur_stats['p95_abs_err_hours']:.2f}h"
         )
     else:
-        true_duration = np.zeros_like(seq["y_dur"])
         pred_duration = np.zeros_like(seq["y_dur"])
         dur_stats = {}
+
+    # -- bin-center MAE (cross-compatible with regression metric) --
+    bin_stats = {}
+    if has_bin_head:
+        bin_classes = list(target_encoders["duration_bin"].classes_)
+        bin_centers_dict = encoders.get("bin_centers") or {}
+        bin_stats = metrics.bin_center_mae(
+            ar_pred_ids["duration_bin"], true_duration, bin_centers_dict,
+            bin_classes, weights=sw.get("duration_bin"),
+        )
+        print(
+            f"  duration_bin  center_MAE={bin_stats['bin_center_mae_hours']:.2f}h  "
+            f"long_center_MAE={bin_stats['bin_center_mae_long_hours']:.2f}h"
+        )
 
     # -- hierarchy validity --
     master_csv = resolve(cfg, cfg["data"]["master_csv"])
@@ -335,6 +377,7 @@ def main():
         "n_wells": int(per_well_df["well_name"].nunique()),
         "top_k": top_k,
         "constraints_enabled": bool(enforce_hierarchy),
+        "constraints_5d": bool(use_5d_constraints),
         "n_legal_tuples": int(legal_tuples.shape[0]) if legal_tuples is not None else None,
         "tf": {
             **{f"{h}_top1": tf_scores[h]["overall_top1"] for h in active_targets},
@@ -349,9 +392,13 @@ def main():
             "hierarchy_validity_rate": hierarchy_validity_rate,
             "conditional_acc": cond,
             **dur_stats,
+            **bin_stats,
             "well_accuracy_std": well_std,
         },
     }
+    if has_bin_head:
+        summary["ar"]["duration_bin_per_step_top1"] = ar_scores["duration_bin"]["per_step_top1"]
+        summary["ar"][f"duration_bin_per_step_top{top_k}"] = ar_scores["duration_bin"]["per_step_topk"]
     if tuple_topk_hit_rate is not None:
         summary["ar"][f"tuple_top{top_k}_overall"] = tuple_topk_hit_rate["overall"]
         summary["ar"][f"tuple_top{top_k}_per_step"] = tuple_topk_hit_rate["per_step"]
@@ -363,7 +410,10 @@ def main():
 
     artifacts.write_summary(out_dir, summary)
     artifacts.write_run_config(out_dir, vars(args), model_config)
-    artifacts.write_per_step_accuracy(out_dir, tf_scores, ar_scores)
+    artifacts.write_per_step_accuracy(
+        out_dir, tf_scores, ar_scores,
+        extra_heads=(["duration_bin"] if has_bin_head else None),
+    )
     artifacts.write_confusion_csvs(out_dir, confusion_dfs)
     artifacts.write_per_well(out_dir, per_well_df)
 
@@ -376,6 +426,8 @@ def main():
             tuple_topk_labels=tuple_topk_labels,
             tuple_topk_logprob=tuple_topk_logprob,
             tuple_topk_prob=tuple_topk_prob,
+            bin_centers=encoders.get("bin_centers"),
+            include_bins_in_tuples=use_5d_constraints,
         )
 
     print("\nDone.")

@@ -55,21 +55,42 @@ def _render_ml_debug(ml_output):
     a step sum to 1). `logP` is the raw joint log-prob — useful for spotting
     low-confidence steps even when top-K probs look similar. Duration is a
     per-step scalar, shown only on rank-1 so the table stays readable.
+
+    When the bin classification head is active, an extra `Dur bin top-K`
+    column appears on rank-1 with the top-K bin labels + probabilities. When
+    5D constraint mode is on, each tuple also carries its joint-argmax bin
+    via `Dur bin`. Both columns are hidden when the bin head is off.
     """
+    has_bin_topk = any(s.duration_bin_topk for s in ml_output.steps)
+    has_5d_bin = any(
+        any(t.duration_bin is not None for t in s.topk_tuples)
+        for s in ml_output.steps
+    )
+
     rows = []
     for s in ml_output.steps:
+        bin_topk_str = ""
+        if has_bin_topk and s.duration_bin_topk:
+            bin_topk_str = " | ".join(
+                f"{db.label} ({db.prob:.2f})" for db in s.duration_bin_topk
+            )
         for rank, tup in enumerate(s.topk_tuples, start=1):
-            rows.append({
+            row = {
                 "Step": s.step + 1,
                 "Rank": rank,
                 "Phase": tup.phase,
                 "Phase_Step": tup.phase_step,
                 "Major_Ops_Code": tup.major_ops_code,
                 "Operation": tup.operation,
-                "prob": round(tup.prob, 3),
-                "logP": round(tup.log_prob, 3),
-                "Dur (hrs)": round(s.duration_hours, 2) if rank == 1 else None,
-            })
+            }
+            if has_5d_bin:
+                row["Dur bin"] = tup.duration_bin or ""
+            row["prob"] = round(tup.prob, 3)
+            row["logP"] = round(tup.log_prob, 3)
+            row["Dur (hrs)"] = round(s.duration_hours, 2) if rank == 1 else None
+            if has_bin_topk:
+                row["Dur bin top-K"] = bin_topk_str if rank == 1 else ""
+            rows.append(row)
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 

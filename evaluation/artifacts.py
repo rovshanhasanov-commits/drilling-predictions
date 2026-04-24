@@ -35,10 +35,16 @@ def write_per_step_accuracy(
     out_dir: Path,
     tf_scores: dict,
     ar_scores: dict,
+    extra_heads: list[str] | None = None,
 ) -> Path:
-    """Tidy table: one row per (head, mode, step)."""
+    """Tidy table: one row per (head, mode, step).
+
+    `extra_heads` lets non-hierarchy heads (e.g. `duration_bin`) flow into the
+    same CSV without a schema change.
+    """
+    heads_to_emit = list(HIERARCHY) + list(extra_heads or [])
     rows = []
-    for head in HIERARCHY:
+    for head in heads_to_emit:
         for mode, scores in (("tf", tf_scores), ("ar", ar_scores)):
             if head not in scores:
                 continue
@@ -79,9 +85,11 @@ def write_predictions_csv(
     true_duration: np.ndarray,
     pred_duration: np.ndarray,
     hierarchy_valid: np.ndarray,   # (n, K) bool
-    tuple_topk_labels: np.ndarray | None = None,   # (n, K, top_k, 4) str; HIERARCHY order on last axis
+    tuple_topk_labels: np.ndarray | None = None,   # (n, K, top_k, n_joint) str
     tuple_topk_logprob: np.ndarray | None = None,  # (n, K, top_k) float, raw joint log-prob
     tuple_topk_prob: np.ndarray | None = None,     # (n, K, top_k) float, renormalized over L
+    bin_centers: dict | None = None,               # {label: hours}
+    include_bins_in_tuples: bool = False,          # 5D mode marker (last col of tuples is the bin)
 ) -> Path:
     """One row per (sequence_idx, step). Large but grep-friendly.
 
@@ -134,6 +142,30 @@ def write_predictions_csv(
             )
             row["hierarchy_valid"] = bool(hierarchy_valid[seq, step])
 
+            # Bin head columns — emitted only when the bin head was active
+            # (caller passes "duration_bin" in true/pred labels).
+            if "duration_bin" in true_labels:
+                true_bin = str(true_labels["duration_bin"][seq, step])
+                pred_bin_top1 = str(pred_top1_labels["duration_bin"][seq, step])
+                pred_bin_topk = pred_topk_labels["duration_bin"][seq, step]
+                row["true_duration_bin"]      = true_bin
+                row["pred_duration_bin_top1"] = pred_bin_top1
+                row["pred_duration_bin_top3"] = "|".join(
+                    str(x) for x in pred_bin_topk.tolist()
+                )
+                row["duration_bin_in_top3"] = bool(true_bin in [str(x) for x in pred_bin_topk])
+                if bin_centers is not None:
+                    center = bin_centers.get(pred_bin_top1, float("nan"))
+                    row["duration_bin_top1_center_hours"] = (
+                        round(float(center), 4) if center == center else None
+                    )
+                    if center == center:   # not NaN -> sentinel-aware err
+                        row["duration_bin_abs_err_hours"] = round(
+                            float(abs(center - true_duration[seq, step])), 4
+                        )
+                    else:
+                        row["duration_bin_abs_err_hours"] = None
+
             if have_tuples:
                 # Ground-truth state string (pipe-joined), when all 4 head labels are present.
                 true_state_parts = [true_labels[h][seq, step] for h in HIERARCHY if h in true_labels]
@@ -145,6 +177,9 @@ def write_predictions_csv(
                     # Parsed per-head columns (kept for backward compat / detail work).
                     for j, h in enumerate(HIERARCHY):
                         row[f"pred_tuple_{i}_{h}"] = tuple_topk_labels[seq, step, i, j]
+                    if include_bins_in_tuples:
+                        # 5D mode: 5th column of the joint tuple is the bin label.
+                        row[f"pred_tuple_{i}_duration_bin"] = tuple_topk_labels[seq, step, i, 4]
                     row[f"pred_tuple_{i}_logprob"] = round(
                         float(tuple_topk_logprob[seq, step, i]), 4
                     )

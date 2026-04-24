@@ -266,6 +266,131 @@ def test_joint_topk_tuples_renorm_matches_manual_softmax():
 # summarize_legal_tuples
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 5D legal tuples (include_bins=True)
+# ---------------------------------------------------------------------------
+
+def _make_encoders_with_bin():
+    """4-hierarchy encoders + a duration_bin encoder with the forced class
+    order (bins + EOO + Unplanned + UNK) used by preprocessing/bins.py."""
+    encoders = _make_encoders()
+    from preprocessing.bins import fit_bin_encoder
+    encoders["duration_bin"] = fit_bin_encoder(
+        ["≤0.25 hr", "0.25-0.5 hr", "0.5-1 hr", "1-2 hrs", "2-5 hrs", "5-10 hrs", "10+ hrs"]
+    )
+    return encoders
+
+
+def _df_from_rows_with_bin(encoders, rows: list[dict]) -> pd.DataFrame:
+    bin_le = encoders["duration_bin"]
+    bin_c2i = {c: i for i, c in enumerate(bin_le.classes_)}
+    out = []
+    for r in rows:
+        rec = _encode_row(encoders, r)
+        rec["duration_bin_target_enc"] = bin_c2i[r["duration_bin"]]
+        out.append(rec)
+    return pd.DataFrame(out)
+
+
+def test_build_legal_tuples_5d_returns_n_by_5():
+    encoders = _make_encoders_with_bin()
+    rows = [
+        {"phase": "DRL", "phase_step": "LAT", "major_ops_code": "DRILL",
+         "operation": "DRL", "duration_bin": "1-2 hrs"},
+        {"phase": "DRL", "phase_step": "LAT", "major_ops_code": "DRILL",
+         "operation": "DRL", "duration_bin": "2-5 hrs"},  # same 4-tuple, different bin
+        {"phase": "CASING", "phase_step": "RIH", "major_ops_code": "TRIP",
+         "operation": "RIH", "duration_bin": "0.5-1 hr"},
+    ]
+    df = _df_from_rows_with_bin(encoders, rows)
+    L = build_legal_tuples(df, df.iloc[0:0], df.iloc[0:0], encoders, include_bins=True)
+    assert L.shape == (4, 5)   # 3 distinct 5-tuples + EOO
+    assert L.dtype == np.int32
+
+
+def test_build_legal_tuples_5d_excludes_bin_sentinels_from_5th_axis():
+    encoders = _make_encoders_with_bin()
+    rows = [
+        {"phase": "DRL", "phase_step": "LAT", "major_ops_code": "DRILL",
+         "operation": "DRL", "duration_bin": "1-2 hrs"},     # OK
+        {"phase": "DRL", "phase_step": "LAT", "major_ops_code": "DRILL",
+         "operation": "DRL", "duration_bin": "Unplanned"},   # excluded
+        {"phase": "DRL", "phase_step": "LAT", "major_ops_code": "DRILL",
+         "operation": "DRL", "duration_bin": "UNK"},          # excluded
+    ]
+    df = _df_from_rows_with_bin(encoders, rows)
+    L = build_legal_tuples(df, df.iloc[0:0], df.iloc[0:0], encoders, include_bins=True)
+
+    bin_c2i = {c: i for i, c in enumerate(encoders["duration_bin"].classes_)}
+    assert bin_c2i["Unplanned"] not in L[:, 4].tolist()
+    assert bin_c2i["UNK"]       not in L[:, 4].tolist()
+
+
+def test_build_legal_tuples_5d_eoo_row_has_bin_eoo_id():
+    encoders = _make_encoders_with_bin()
+    rows = [
+        {"phase": "DRL", "phase_step": "LAT", "major_ops_code": "DRILL",
+         "operation": "DRL", "duration_bin": "1-2 hrs"},
+    ]
+    df = _df_from_rows_with_bin(encoders, rows)
+    L = build_legal_tuples(df, df.iloc[0:0], df.iloc[0:0], encoders, include_bins=True)
+
+    bin_eoo_id = list(encoders["duration_bin"].classes_).index("EOO")
+    eoo_4d = [int(list(encoders[h].classes_).index("End of Operations")) for h in HIERARCHY]
+    expected_eoo_5d = np.asarray(eoo_4d + [bin_eoo_id], dtype=np.int32)
+    assert _row_in(L, expected_eoo_5d), \
+        f"5D EOO row {expected_eoo_5d} not present in L = {L}"
+
+
+def _row_in(arr: np.ndarray, row: np.ndarray) -> bool:
+    return bool(np.any(np.all(arr == row, axis=1)))
+
+
+def test_build_legal_tuples_5d_raises_without_bin_encoder():
+    encoders = _make_encoders()  # no duration_bin
+    rows = [{"phase": "DRL", "phase_step": "LAT", "major_ops_code": "DRILL", "operation": "DRL"}]
+    df = _df_from_rows(encoders, rows)
+    df["duration_bin_target_enc"] = 0   # column present but encoder missing
+    with pytest.raises(KeyError, match="duration_bin"):
+        build_legal_tuples(df, df.iloc[0:0], df.iloc[0:0], encoders, include_bins=True)
+
+
+def test_joint_topk_tuples_5d_accepts_and_ranks():
+    """5-axis log-prob sum: bin head contributes a 5th term to the score."""
+    L = np.array([
+        [0, 0, 0, 0, 0],   # tuple A: all-class-0
+        [1, 1, 1, 1, 1],   # tuple B: all-class-1
+        [0, 0, 0, 0, 1],   # tuple C: bin differs from A only on the 5th axis
+    ], dtype=np.int32)
+
+    probs = {
+        "phase":          np.array([[0.6, 0.4]]),
+        "phase_step":     np.array([[0.7, 0.3]]),
+        "major_ops_code": np.array([[0.55, 0.45]]),
+        "operation":      np.array([[0.65, 0.35]]),
+        "duration_bin":   np.array([[0.55, 0.45]]),
+    }
+    head_names = HIERARCHY + ["duration_bin"]
+
+    tuples, log_probs, renorm = joint_topk_tuples(probs, L, k=3, head_names=head_names)
+    assert tuples.shape == (1, 3, 5)
+    assert log_probs[0, 0] >= log_probs[0, 1] >= log_probs[0, 2]
+    # A wins (all per-head 0's strongly dominate).
+    assert tuple(tuples[0, 0].tolist()) == (0, 0, 0, 0, 0)
+
+
+def test_joint_argmax_5d_dimension_check():
+    """Pass a 5D L without head_names override → _score_tuples should raise."""
+    L = np.zeros((1, 5), dtype=np.int32)
+    probs = {h: np.ones((1, 2)) for h in HIERARCHY}
+    with pytest.raises(ValueError, match="L has 5 columns"):
+        joint_argmax(probs, L)   # default head_names=HIERARCHY (len 4)
+
+
+# ---------------------------------------------------------------------------
+# summarize_legal_tuples
+# ---------------------------------------------------------------------------
+
 def test_summarize_legal_tuples_reports_counts():
     encoders = _make_encoders()
     rows = [

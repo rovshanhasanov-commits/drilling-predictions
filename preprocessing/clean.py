@@ -52,6 +52,8 @@ def clean(
     df: pd.DataFrame,
     unplanned_ops: list[str] | None = None,
     unplanned_token: str = "Unplanned",
+    bin_edges: list[float] | None = None,
+    bin_labels: list[str] | None = None,
 ) -> pd.DataFrame:
     """Apply all notebook-style cleanup steps to the joined DataFrame.
 
@@ -64,6 +66,11 @@ def clean(
         unplanned_token: The replacement string for every entry in `unplanned_ops`.
             Becomes a real class at target-encoder fit time, gets its own embedding
             slot, but never receives positive gradient on the op head (mask=0).
+        bin_edges, bin_labels: when both are provided, materializes a `duration_bin`
+            column from raw `Duration hours` (via preprocessing.bins.assign_duration_bin)
+            with sentinel overrides for unplanned ops ("Unplanned") and residual-NaN
+            ops ("UNK"). Used by the bin classification head; see
+            improvements/Duration Binning.md.
     """
     df = df.copy()
 
@@ -186,6 +193,37 @@ def clean(
             df.loc[is_unpl, "Operation"] = unplanned_token
             print(f"  Operation: {int(is_unpl.sum())} rows renamed to "
                   f"'{unplanned_token}' (from {len(unplanned_ops or [])} source strings)")
+
+        # 5h. Duration-bin classification target — coexists with the regression
+        #     head; pipeline.yaml::training.target_variables decides which trains.
+        #     Sentinel overrides match the masking semantics: rows in unplanned ops
+        #     -> "Unplanned"; rows with residual-NaN Operation -> "UNK". Both
+        #     sentinel classes are loss-masked via dur_label_real, so they emit
+        #     no CE on the bin head; they exist only to give the bin encoder a
+        #     consistent vocabulary across all rows. See preprocessing/bins.py.
+        if bin_edges is not None and bin_labels is not None:
+            from preprocessing.bins import assign_duration_bin
+            bin_col = assign_duration_bin(df["Duration hours"], bin_edges, bin_labels)
+            bin_col = bin_col.where(~is_unpl, other="Unplanned")
+            bin_col = bin_col.where(~was_nan, other="UNK")
+            df["duration_bin"] = bin_col.astype(object)
+
+            # Extend dur_label_real to also mask rows where Duration hours is NaN
+            # but Operation is real. Otherwise the bin head trains full gradient
+            # toward "UNK" on these rows. (op/moc heads aren't affected — they
+            # have valid integer labels regardless of duration NaN.)
+            was_nan_dur = df["Duration hours"].isna()
+            extra_mask = was_nan_dur & ~(was_nan | is_unpl)
+            n_extra = int(extra_mask.sum())
+            if n_extra > 0:
+                df["dur_label_real"] = (df["dur_label_real"]
+                                        * (~was_nan_dur).astype("float32"))
+                print(f"  dur_label_real: also masked {n_extra} rows where "
+                      f"Duration hours is NaN but Operation is real "
+                      f"(would otherwise train bin head toward UNK)")
+            counts = df["duration_bin"].value_counts(dropna=False)
+            print(f"  duration_bin: {len(counts)} classes assigned, top: "
+                  f"{counts.head(3).to_dict()}")
 
     # 6. Sort chronologically within each well so the neighbor-fill below uses
     #    the correct adjacent rows. Matches the notebook.
