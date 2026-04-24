@@ -79,9 +79,22 @@ def write_predictions_csv(
     true_duration: np.ndarray,
     pred_duration: np.ndarray,
     hierarchy_valid: np.ndarray,   # (n, K) bool
+    tuple_topk_labels: np.ndarray | None = None,   # (n, K, top_k, 4) str; HIERARCHY order on last axis
+    tuple_topk_logprob: np.ndarray | None = None,  # (n, K, top_k) float
 ) -> Path:
-    """One row per (sequence_idx, step). Large but grep-friendly."""
+    """One row per (sequence_idx, step). Large but grep-friendly.
+
+    When `tuple_topk_labels` is provided (constrained AR path), additional
+    columns `pred_tuple_{i}_{phase,phase_step,major_ops_code,operation}` +
+    `pred_tuple_{i}_logprob` are emitted for i in 0..K-1. The per-head
+    pred_{head}_top1 / pred_{head}_top3 columns stay populated (they come
+    from the coordinated tuple's first / top-K rows under constraints) so
+    downstream consumers don't break.
+    """
     n, n_future = hierarchy_valid.shape
+    have_tuples = tuple_topk_labels is not None and tuple_topk_logprob is not None
+    K_tuple = tuple_topk_labels.shape[2] if have_tuples else 0
+
     records = []
     for seq in range(n):
         for step in range(n_future):
@@ -105,6 +118,22 @@ def write_predictions_csv(
                 float(abs(pred_duration[seq, step] - true_duration[seq, step])), 4
             )
             row["hierarchy_valid"] = bool(hierarchy_valid[seq, step])
+
+            if have_tuples:
+                for i in range(K_tuple):
+                    for j, h in enumerate(HIERARCHY):
+                        row[f"pred_tuple_{i}_{h}"] = tuple_topk_labels[seq, step, i, j]
+                    row[f"pred_tuple_{i}_logprob"] = round(
+                        float(tuple_topk_logprob[seq, step, i]), 4
+                    )
+                # Did the ground-truth tuple appear in the top-K legal tuples?
+                true_tup = tuple(true_labels[h][seq, step] for h in HIERARCHY if h in true_labels)
+                if len(true_tup) == 4:
+                    tuples_at_step = tuple_topk_labels[seq, step]   # (top_k, 4)
+                    row["tuple_in_topk"] = bool(
+                        any(tuple(tuples_at_step[i]) == true_tup for i in range(K_tuple))
+                    )
+
             records.append(row)
 
     df = pd.DataFrame.from_records(records)

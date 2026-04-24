@@ -48,17 +48,24 @@ def _render_ops_table(ops: list[dict], duration_tol: float):
 
 
 def _render_ml_debug(ml_output):
-    """Flatten the MLOutput into a top-K debug table the user can inspect."""
+    """Flatten the MLOutput into a top-K legal-tuple debug table.
+
+    Each step expands into K rows, one per ranked hierarchy tuple. Duration
+    is a per-step scalar, shown only on rank-1 so the table stays readable.
+    """
     rows = []
     for s in ml_output.steps:
-        rows.append({
-            "Step": s.step + 1,
-            "Phase top-K": " | ".join(f"{l} ({p:.2f})" for l, p in zip(s.phase.labels, s.phase.probs)),
-            "Phase_Step top-K": " | ".join(f"{l} ({p:.2f})" for l, p in zip(s.phase_step.labels, s.phase_step.probs)),
-            "MOC top-K": " | ".join(f"{l} ({p:.2f})" for l, p in zip(s.major_ops_code.labels, s.major_ops_code.probs)),
-            "Operation top-K": " | ".join(f"{l} ({p:.2f})" for l, p in zip(s.operation.labels, s.operation.probs)),
-            "Dur (hrs)": round(s.duration_hours, 2),
-        })
+        for rank, tup in enumerate(s.topk_tuples, start=1):
+            rows.append({
+                "Step": s.step + 1,
+                "Rank": rank,
+                "Phase": tup.phase,
+                "Phase_Step": tup.phase_step,
+                "Major_Ops_Code": tup.major_ops_code,
+                "Operation": tup.operation,
+                "logP": round(tup.log_prob, 3),
+                "Dur (hrs)": round(s.duration_hours, 2) if rank == 1 else None,
+            })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 

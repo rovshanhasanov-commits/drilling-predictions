@@ -1,10 +1,18 @@
 """Evaluation utilities. Reports top-1 AND top-3 accuracy per step (per the user's
 "off by 1" hypothesis), and autoregressive inference for end-to-end check.
+
+Supports constrained decoding via the optional `legal_tuples` kwarg on
+`autoregressive_predict`. When provided, per-step outputs are chosen by joint
+argmax over the legal-tuple table (see training/constraints.py) and the winning
+tuple's class ids are fed back as the next step's decoder inputs — this keeps
+the four heads coordinated throughout the horizon.
 """
 
 from __future__ import annotations
 
 import numpy as np
+
+from .constraints import HIERARCHY, joint_topk_tuples
 
 
 def _topk_hit(probs: np.ndarray, true: np.ndarray, k: int) -> np.ndarray:
@@ -62,13 +70,32 @@ def autoregressive_predict(
     active_targets: list[str], predict_duration: bool,
     batch_size: int = 256,
     top_k: int = 3,
+    legal_tuples: np.ndarray | None = None,
 ):
     """Autoregressive decode. Returns per-target arrays:
-        - '{target}_pred':  (batch, N_future)             argmax predictions
-        - '{target}_topk':  (batch, N_future, top_k)      top-k class ids per step
-        - '{target}_topk_probs': (batch, N_future, top_k) corresponding probs
-        - 'duration' (if enabled): (batch, N_future)
+        - 'pred[head]':        (batch, N_future)            argmax / joint-argmax predictions
+        - 'topk[head]':        (batch, N_future, top_k)     top-k class ids per step
+        - 'topk_probs[head]':  (batch, N_future, top_k)     corresponding probs
+        - 'duration' (if predict_duration): (batch, N_future)
+
+    When `legal_tuples` is provided (shape (num_legal, 4), int32):
+        - Per-step argmax becomes joint argmax over the legal-tuple table.
+        - `topk` + `topk_probs` are still populated (per-head ranks unchanged)
+          so legacy callers work, but the result dict also includes:
+            - 'tuple_pred':          (batch, N_future, 4)     chosen legal tuple per step
+            - 'tuple_topk':          (batch, N_future, K, 4)  top-K legal tuples per step
+            - 'tuple_topk_logprob':  (batch, N_future, K)     joint log-probs
+        - The winning tuple's class ids feed back as next-step decoder inputs —
+          this is what prevents mid-sequence drift (vs. independent per-head argmax).
     """
+    use_constraints = legal_tuples is not None
+    if use_constraints:
+        missing = [h for h in HIERARCHY if h not in active_targets]
+        if missing:
+            raise ValueError(
+                f"legal_tuples requires all 4 hierarchy heads in active_targets; missing {missing}"
+            )
+
     n_samples = enc_X[0].shape[0]
     enc_out, h, c = encoder_model.predict(enc_X, batch_size=batch_size, verbose=0)
 
@@ -77,6 +104,12 @@ def autoregressive_predict(
     topkp = {t: np.zeros((n_samples, n_future, top_k), dtype=np.float32) for t in active_targets}
     if predict_duration:
         preds["duration"] = np.zeros((n_samples, n_future), dtype=np.float32)
+
+    if use_constraints:
+        K_tuple = min(int(top_k), int(legal_tuples.shape[0]))
+        tuple_pred          = np.zeros((n_samples, n_future, 4), dtype=np.int32)
+        tuple_topk          = np.zeros((n_samples, n_future, K_tuple, 4), dtype=np.int32)
+        tuple_topk_logprob  = np.zeros((n_samples, n_future, K_tuple), dtype=np.float32)
 
     prev_cat = {t: np.full((n_samples, 1), n_classes[t], dtype=np.int32) for t in active_targets}
     prev_dur = np.zeros((n_samples, 1), dtype=np.float32) if predict_duration else None
@@ -89,16 +122,34 @@ def autoregressive_predict(
 
         step_out = decoder_step_model.predict(dec_step_in, batch_size=batch_size, verbose=0)
 
+        # Collect per-head probabilities for this step.
+        step_probs: dict = {}
         idx = 0
         for t in active_targets:
             probs = step_out[idx][:, 0, :]                       # (batch, n_classes)
-            pred_cls = probs.argmax(axis=-1)
+            step_probs[t] = probs
+            # Per-head top-K ranks stay populated for back-compat / diagnostics.
             order = np.argsort(-probs, axis=-1)[:, :top_k]
-            preds[t][:, step] = pred_cls
             topk[t][:, step, :] = order
             topkp[t][:, step, :] = np.take_along_axis(probs, order, axis=-1)
-            prev_cat[t] = pred_cls.reshape(-1, 1)
             idx += 1
+
+        if use_constraints:
+            # Joint top-K first (argmax = top-1).
+            tk_tuples, tk_scores = joint_topk_tuples(step_probs, legal_tuples, K_tuple)
+            tuple_topk[:, step, :, :]       = tk_tuples
+            tuple_topk_logprob[:, step, :]  = tk_scores
+            chosen = tk_tuples[:, 0, :]                          # (batch, 4)
+            tuple_pred[:, step, :] = chosen
+            for i, t in enumerate(HIERARCHY):
+                preds[t][:, step] = chosen[:, i]
+                prev_cat[t] = chosen[:, i:i + 1]                 # feedback
+        else:
+            for t in active_targets:
+                pred_cls = step_probs[t].argmax(axis=-1)
+                preds[t][:, step] = pred_cls
+                prev_cat[t] = pred_cls.reshape(-1, 1)
+
         if predict_duration:
             dur_val = step_out[idx][:, 0, 0]
             preds["duration"][:, step] = dur_val
@@ -108,8 +159,13 @@ def autoregressive_predict(
         h = step_out[idx]
         c = step_out[idx + 1]
 
-    return {
+    out = {
         "pred": preds,
         "topk": topk,
         "topk_probs": topkp,
     }
+    if use_constraints:
+        out["tuple_pred"]         = tuple_pred
+        out["tuple_topk"]         = tuple_topk
+        out["tuple_topk_logprob"] = tuple_topk_logprob
+    return out

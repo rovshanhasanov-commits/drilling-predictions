@@ -7,6 +7,7 @@ Usage:
     python -m evaluation.run_evaluation --limit 500               # first 500 sequences
     python -m evaluation.run_evaluation --no-csv                  # skip predictions.csv
     python -m evaluation.run_evaluation --wells A,B               # restrict to these wells
+    python -m evaluation.run_evaluation --no-constraints          # disable constrained AR decoding
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from config import get_model_dir, load_config, model_folder_name, resolve        # noqa: E402
 from inference.load import load_bundle                                           # noqa: E402
+from training.constraints import build_legal_tuples, summarize_legal_tuples      # noqa: E402
 from training.data import (                                                      # noqa: E402
     HIERARCHY, build_seq2seq_sequences, compute_numeric_cols,
     eoo_duration_value, eoo_encoded_ids, load_strategy_data, make_decoder_inputs,
@@ -48,6 +50,9 @@ def parse_args():
                     help="Batch size for decoder step model.")
     ap.add_argument("--no-csv", action="store_true",
                     help="Skip the large per-row predictions.csv.")
+    ap.add_argument("--no-constraints", action="store_true",
+                    help="Disable constrained (joint-argmax) decoding on the AR path. "
+                         "TF path is never constrained — it's the unconstrained upper bound.")
     return ap.parse_args()
 
 
@@ -69,6 +74,7 @@ def main():
     args = parse_args()
     cfg = load_config()
     tcfg = cfg["training"]
+    icfg = cfg.get("inference", {}) or {}
 
     # -- resolve model dir and load bundle --
     model_dir = Path(args.model_dir).resolve() if args.model_dir else get_model_dir(cfg)
@@ -93,10 +99,24 @@ def main():
     active_targets = [t.replace("_next", "") for t in tcfg["target_variables"] if t != "duration_next"]
     predict_duration = "duration_next" in tcfg["target_variables"]
 
-    # -- load the chosen split --
+    # -- load all splits once: the chosen split drives eval, the union drives L --
     split_bundle = load_strategy_data(strategy_dir)
     split_map = {"train": "df_train", "val": "df_val", "test": "df_test"}
     df_split = split_bundle[split_map[args.split]].copy()
+
+    # Legal-tuple table from train ∪ val ∪ test (treated as SME domain knowledge,
+    # not a leakage surface — see improvements/Constraint Decoder.md).
+    enforce_hierarchy = (not args.no_constraints) and icfg.get("enforce_hierarchy", True)
+    legal_tuples = None
+    if enforce_hierarchy:
+        legal_tuples = build_legal_tuples(
+            split_bundle["df_train"], split_bundle["df_val"], split_bundle["df_test"],
+            target_encoders, eoo_token=eoo_token,
+        )
+        stats = summarize_legal_tuples(legal_tuples, target_encoders)
+        print(f"Legal tuples: {stats}")
+    else:
+        print("Constraints disabled (--no-constraints or inference.enforce_hierarchy=false)")
 
     if args.wells:
         filters = [s.strip() for s in args.wells.split(",") if s.strip()]
@@ -135,7 +155,7 @@ def main():
 
     print(f"Sequences: {seq['num'].shape[0]:,} | wells: {len(set(seq['wells']))}")
 
-    # -- teacher-forced predictions (upper bound) --
+    # -- teacher-forced predictions (unconstrained upper bound) --
     enc_X = prep_encoder_inputs(seq["cat"], seq["num"], cat_input_cols)
     dec_tf = make_decoder_inputs(seq["y"], n_classes, active_targets, predict_duration, seq["y_dur"])
     X_tf = prep_model_inputs(enc_X, dec_tf, active_targets, predict_duration)
@@ -154,15 +174,19 @@ def main():
         tf_scores[h] = per_step_accuracy(tf_raw[h], true, k=top_k, weights=sw.get(h))
         print(f"  TF {h:20s}  top1={tf_scores[h]['overall_top1']:.4f}  top{top_k}={tf_scores[h]['overall_topk']:.4f}")
 
-    # -- autoregressive predictions (deployment) --
-    print("Running autoregressive predictions...")
+    # -- autoregressive predictions (deployment; constrained when legal_tuples is set) --
+    print(f"Running autoregressive predictions (constraints={'on' if enforce_hierarchy else 'off'})...")
     ar = autoregressive_predict(
         encoder_model, decoder_step_model, enc_X, n_future, n_classes,
         active_targets, predict_duration, batch_size=args.batch_size, top_k=top_k,
+        legal_tuples=legal_tuples,
     )
     ar_pred_ids = ar["pred"]                         # {head: (n, n_future)}
     ar_topk_ids = ar["topk"]                         # {head: (n, n_future, top_k)}
 
+    # Per-head top-1 / top-K accuracy. When constraints are on, ar_pred_ids[h]
+    # comes from the winning legal tuple (coordinated across heads). topk stays
+    # per-head for diagnostics; tuple-level top-K is reported separately.
     ar_scores = {}
     for h in active_targets:
         true = seq["y"][f"{h}_target_enc"]
@@ -190,12 +214,49 @@ def main():
         }
         print(f"  AR {h:20s}  top1={ar_scores[h]['overall_top1']:.4f}  top{top_k}={ar_scores[h]['overall_topk']:.4f}")
 
+    # Tuple-level top-K accuracy: did the ground-truth tuple appear in the
+    # chosen top-K legal tuples at this step? Only meaningful under constraints.
+    tuple_topk_hit_rate = None
+    if enforce_hierarchy and "tuple_topk" in ar:
+        tuple_topk = ar["tuple_topk"]                  # (n, n_future, K, 4)
+        y = seq["y"]
+        true_stack = np.stack([y[f"{h}_target_enc"] for h in HIERARCHY], axis=-1)  # (n, n_future, 4)
+        # Use the op-head mask as the gate (matches legacy behavior: excludes
+        # masked-target rows from per-head accuracy). Tuples aren't meaningful
+        # when the op head's ground truth is masked anyway.
+        w_op = sw.get("operation")
+        per_step_hits = []
+        for s in range(n_future):
+            hits = (tuple_topk[:, s, :, :] == true_stack[:, s:s + 1, :]).all(axis=-1).any(axis=-1)
+            if w_op is not None:
+                keep = w_op[:, s] > 0
+                if not keep.any():
+                    per_step_hits.append(float("nan"))
+                    continue
+                hits = hits[keep]
+            per_step_hits.append(float(hits.mean()))
+        tuple_topk_hit_rate = {
+            "per_step": per_step_hits,
+            "overall":  float(np.nanmean(per_step_hits)),
+        }
+        print(f"  AR tuple_top{top_k}         overall={tuple_topk_hit_rate['overall']:.4f}")
+
     # -- decode ids -> label strings for downstream reporting --
     ar_pred_labels = {h: _decode_ids(ar_pred_ids[h], target_encoders[h]) for h in active_targets}
     ar_topk_labels = {h: _decode_ids(ar_topk_ids[h], target_encoders[h]) for h in active_targets}
     true_labels = {
         h: _decode_ids(seq["y"][f"{h}_target_enc"], target_encoders[h]) for h in active_targets
     }
+
+    # Top-K tuple labels for predictions.csv (only populated under constraints).
+    tuple_topk_labels = None
+    tuple_topk_logprob = None
+    if enforce_hierarchy and "tuple_topk" in ar:
+        tk = ar["tuple_topk"]                          # (n, n_future, K, 4), ids
+        tuple_topk_labels = np.empty(tk.shape, dtype=object)
+        for i, h in enumerate(HIERARCHY):
+            tuple_topk_labels[..., i] = _decode_ids(tk[..., i], target_encoders[h])
+        tuple_topk_logprob = ar["tuple_topk_logprob"]  # (n, n_future, K)
 
     # -- duration (inverse-transform to hours) --
     if predict_duration:
@@ -220,7 +281,8 @@ def main():
         sets, eoo_token,
     )
     hierarchy_validity_rate = float(hier_valid.mean())
-    print(f"  hierarchy_validity_rate = {hierarchy_validity_rate:.4f}")
+    print(f"  hierarchy_validity_rate = {hierarchy_validity_rate:.4f}"
+          f"{' (1.0 by construction under constraints)' if enforce_hierarchy else ''}")
 
     cond = {
         "phase_step_given_phase": metrics.conditional_accuracy(
@@ -270,6 +332,8 @@ def main():
         "n_sequences": int(seq["num"].shape[0]),
         "n_wells": int(per_well_df["well_name"].nunique()),
         "top_k": top_k,
+        "constraints_enabled": bool(enforce_hierarchy),
+        "n_legal_tuples": int(legal_tuples.shape[0]) if legal_tuples is not None else None,
         "tf": {
             **{f"{h}_top1": tf_scores[h]["overall_top1"] for h in active_targets},
             **{f"{h}_top{top_k}": tf_scores[h]["overall_topk"] for h in active_targets},
@@ -286,6 +350,9 @@ def main():
             "well_accuracy_std": well_std,
         },
     }
+    if tuple_topk_hit_rate is not None:
+        summary["ar"][f"tuple_top{top_k}_overall"] = tuple_topk_hit_rate["overall"]
+        summary["ar"][f"tuple_top{top_k}_per_step"] = tuple_topk_hit_rate["per_step"]
 
     # -- write artifacts --
     out_dir = _build_out_dir(cfg, args)
@@ -304,6 +371,8 @@ def main():
             out_dir, seq["wells"], seq["start_idx"],
             true_labels, {h: ar_pred_labels[h] for h in active_targets}, ar_topk_labels,
             true_duration, pred_duration, hier_valid,
+            tuple_topk_labels=tuple_topk_labels,
+            tuple_topk_logprob=tuple_topk_logprob,
         )
 
     print("\nDone.")

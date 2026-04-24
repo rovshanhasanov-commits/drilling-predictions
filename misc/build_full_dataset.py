@@ -34,7 +34,11 @@ def build(cfg_path: str | None = None):
     comments_csv = resolve(cfg, cfg["data"]["comments_csv"])
 
     df = load_and_join(master_csv, comments_csv, cfg)
-    df = clean(df)
+    df = clean(
+        df,
+        unplanned_ops=cfg.get("preprocessing", {}).get("unplanned_operations", []),
+        unplanned_token=cfg.get("preprocessing", {}).get("unplanned_token", "Unplanned"),
+    )
     df, bin_cols = engineer(
         df,
         operator_col=cfg["features"]["operator_column"],

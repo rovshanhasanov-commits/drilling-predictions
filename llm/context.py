@@ -58,31 +58,44 @@ def context_constraints(constraints_md: str) -> str:
 def context_ml_predictions(ml: MLOutput, fields: Iterable[str]) -> str:
     """Render the ML output as a markdown table, honoring the config's field allowlist.
 
-    `fields` controls which level columns appear. Example: ['phase', 'major_ops_code'] hides
-    phase_step and operation. duration_hours is included if present in `fields`.
+    Under the constraint decoder, each step surfaces K **consistent** hierarchy
+    tuples (phase / phase_step / major_ops_code / operation move together).
+    The `fields` allowlist still hides columns — e.g. `['phase','major_ops_code']`
+    suppresses phase_step and operation inside each tuple — but the K tuples
+    themselves always travel as one unit.
+
+    `logP` is the joint log-probability (sum over all four head log-probs).
+    `duration_hours` is a per-step scalar; shown only on rank-1 to avoid clutter.
     """
     fields = list(fields)
     level_fields = [f for f in fields if f in ("phase", "phase_step", "major_ops_code", "operation")]
     show_dur = "duration_hours" in fields
     k = ml.top_k
 
-    lines = [f"## Context 4: ML-Predicted Sequence (top-{k} per step)"]
+    lines = [f"## Context 4: ML-Predicted Sequence (top-{k} legal tuples per step)"]
     lines.append(f"Model horizon: {ml.n_future} steps")
-    header_cells = ["Step"] + [f.capitalize() for f in level_fields]
+    lines.append(
+        "Each step lists the top-K (phase / phase_step / major_ops_code / operation) "
+        "combinations the model judged most likely. Every tuple is guaranteed "
+        "consistent with the drilling hierarchy (the ML stage already validated "
+        "against Context 3). `logP` is the joint log-probability across all four "
+        "heads — closer to zero means higher confidence."
+    )
+    header_cells = ["Step", "Rank"] + [f.capitalize() for f in level_fields] + ["logP"]
     if show_dur:
         header_cells.append("Dur_hrs")
     lines.append("| " + " | ".join(header_cells) + " |")
     lines.append("|" + "|".join(["---"] * len(header_cells)) + "|")
 
     for s in ml.steps:
-        row = [str(s.step + 1)]
-        for f in level_fields:
-            lvl: "LevelPrediction" = getattr(s, f)
-            top_strs = [f"{lab} ({p:.2f})" for lab, p in zip(lvl.labels, lvl.probs)]
-            row.append("<br>".join(top_strs))
-        if show_dur:
-            row.append(f"{s.duration_hours:.2f}")
-        lines.append("| " + " | ".join(row) + " |")
+        for i, tup in enumerate(s.topk_tuples):
+            row = [str(s.step + 1), str(i + 1)]
+            for f in level_fields:
+                row.append(str(getattr(tup, f)))
+            row.append(f"{tup.log_prob:.2f}")
+            if show_dur:
+                row.append(f"{s.duration_hours:.2f}" if i == 0 else "")
+            lines.append("| " + " | ".join(row) + " |")
 
     return "\n".join(lines)
 

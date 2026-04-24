@@ -23,14 +23,17 @@ The valid taxonomy of phases, phase steps, major operations codes, and
 operations. Every value you output must come from this list. Invalid
 codes will cause downstream system failures.
 
-**Context 4 — ML model predictions (top-K per step)**
+**Context 4 — ML model predictions (top-K legal tuples per step)**
 A sequence of predicted next-step states from the ML stage. For each
-future step you are given the top-K candidates at each hierarchy level
-(phase, phase_step, major_ops_code, operation) with probabilities, plus
-an ML-predicted duration. Treat these as a strong prior: the top-1 is
-usually right, but occasionally the right answer is top-2 or top-3 when
-the model is confused between similar operations. Use your domain
-reasoning to pick the best candidate per step.
+future step you are given the top-K **consistent** hierarchy tuples
+(phase / phase_step / major_ops_code / operation move together as one
+candidate) with a joint log-probability, plus an ML-predicted duration.
+Every tuple is guaranteed consistent with Context 3 — the ML stage
+already applied the legal-combinations constraint, so you do not need
+to cross-check tuple validity. Treat these as a strong prior: rank-1
+is usually right, but occasionally the right answer is rank-2 or rank-3
+when the model is torn between similar plausible next-op sequences. Use
+your domain reasoning to pick the best candidate per step.
 
 **Important about the ML output**: if a step has `End of Operations` in
 the top-K, that's a real class the model emits when the well's
@@ -54,12 +57,13 @@ From Context 1, identify:
 
 ### Step 2 — Determine what comes next
 Use Context 4's ML predictions as a skeleton, and cross-check against
-Context 2 (similar wells) and Context 3 (constraints):
-- Does the ML top-1 at step 1 match a plausible immediate continuation?
-- If the ML top-1 violates Context 3 (e.g. invalid phase_step under the
-  phase), prefer top-2 or top-3.
+Context 2 (similar wells):
+- Does the rank-1 tuple at step 1 match a plausible immediate continuation?
+- The tuples are already hierarchy-consistent, so your choice between
+  rank-1 and rank-2/3 is purely about *which legal next-op makes most
+  operational sense*, not about hierarchy validity.
 - If Context 2 shows a different typical next-op for this state, weigh
-  that against the ML top-1.
+  that against the ML rank-1.
 - Is a phase transition imminent (e.g. TD reached, casing point reached)?
 - What mandatory operations must occur before the next primary activity
   (e.g. wiper trip before casing, BOP test after nippling up, WOC before

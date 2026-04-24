@@ -130,8 +130,13 @@ def build_seq2seq_model(
     for t in active_targets:
         outputs[t] = layers.Dense(n_classes[t], activation="softmax", name=t)(sx)
     if predict_duration:
+        # Dense(1) yields (B, n_future, 1); Reshape drops the trailing singleton so
+        # the "duration" output is (B, n_future), matching y_dur's shape.
+        # NOTE: this used to be layers.Lambda(lambda z: z[..., 0]) — inline lambdas
+        # don't round-trip through `.keras` save/load reliably on Keras 3 even with
+        # safe_mode=False, which broke the `predict_duration=True` bundle.
         dur_dense = layers.Dense(1, activation="linear", name="dur_linear")(sx)
-        outputs["duration"] = layers.Lambda(lambda z: z[..., 0], name="duration")(dur_dense)
+        outputs["duration"] = layers.Reshape((n_future,), name="duration")(dur_dense)
 
     training_model = Model(inputs=enc_inputs + dec_inputs, outputs=outputs)
 

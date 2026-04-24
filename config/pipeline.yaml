@@ -164,6 +164,17 @@ training:
   results_dir:    "results"
 
 # ---------------------------------------------------------------------------
+# Inference — constrained decoding + top-K surfaced to downstream stages.
+# The constraint decoder enforces that every (phase, phase_step, major_ops_code,
+# operation) prediction forms a tuple observed in the cleaned data — built from
+# the union of train+val+test parquets at bundle load time. See
+# improvements/Constraint Decoder.md for the full design.
+# ---------------------------------------------------------------------------
+inference:
+  enforce_hierarchy: true      # joint argmax over legal tuples; false = unconstrained per-head argmax
+  top_k_tuples:     3          # how many legal tuples to surface per step (MLOutput + LLM prompt)
+
+# ---------------------------------------------------------------------------
 # LLM stage — controls which ML outputs are exposed to Claude and the API call
 # ---------------------------------------------------------------------------
 llm:
