@@ -251,12 +251,14 @@ def main():
     # Top-K tuple labels for predictions.csv (only populated under constraints).
     tuple_topk_labels = None
     tuple_topk_logprob = None
+    tuple_topk_prob = None
     if enforce_hierarchy and "tuple_topk" in ar:
         tk = ar["tuple_topk"]                          # (n, n_future, K, 4), ids
         tuple_topk_labels = np.empty(tk.shape, dtype=object)
         for i, h in enumerate(HIERARCHY):
             tuple_topk_labels[..., i] = _decode_ids(tk[..., i], target_encoders[h])
-        tuple_topk_logprob = ar["tuple_topk_logprob"]  # (n, n_future, K)
+        tuple_topk_logprob = ar["tuple_topk_logprob"]  # (n, n_future, K) raw joint log-probs
+        tuple_topk_prob    = ar["tuple_topk_prob"]     # (n, n_future, K) renormalized over L
 
     # -- duration (inverse-transform to hours) --
     if predict_duration:
@@ -373,6 +375,7 @@ def main():
             true_duration, pred_duration, hier_valid,
             tuple_topk_labels=tuple_topk_labels,
             tuple_topk_logprob=tuple_topk_logprob,
+            tuple_topk_prob=tuple_topk_prob,
         )
 
     print("\nDone.")

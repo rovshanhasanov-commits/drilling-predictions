@@ -130,6 +130,22 @@ def _score_tuples(probs: dict, L: np.ndarray) -> np.ndarray:
     )
 
 
+def _renormalize_over_L(scores: np.ndarray) -> np.ndarray:
+    """Softmax over the legal-tuple axis — numerically stable, no scipy.
+
+    Input  scores: (B, num_legal) raw joint log-probs.
+    Output probs:  (B, num_legal), sums to 1 along axis -1.
+
+    Semantic: `probs[b, i]` is tuple i's share of the probability mass the
+    four independent head-softmaxes placed on legal tuples. Raw log-probs sum
+    to `P_legal <= 1` across L because the 4 softmaxes also put mass on
+    illegal combinations; renormalizing strips that out.
+    """
+    m = scores.max(axis=-1, keepdims=True)
+    exp_shifted = np.exp(scores - m)
+    return exp_shifted / exp_shifted.sum(axis=-1, keepdims=True)
+
+
 def joint_argmax(probs: dict, L: np.ndarray) -> np.ndarray:
     """Return the single legal tuple per sample with the highest joint log-prob.
 
@@ -151,7 +167,7 @@ def joint_topk_tuples(
     probs: dict,
     L: np.ndarray,
     k: int,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return the top-K legal tuples per sample, sorted by joint log-prob desc.
 
     Args:
@@ -160,13 +176,22 @@ def joint_topk_tuples(
         k:     number of tuples to return per sample. Clipped to len(L).
 
     Returns:
-        topk_tuples: (B, k, 4) int32
-        topk_scores: (B, k)    float32 — joint log-probabilities
+        topk_tuples: (B, k, 4) int32 — chosen legal tuples
+        topk_log_probs: (B, k) float32 — raw joint log-prob `log P(tuple)`
+                                          (sum of the 4 head log-probs; `exp()` gives
+                                          the unnormalized joint probability, which
+                                          is `<= P_legal <= 1` across the full L)
+        topk_probs: (B, k) float32 — **renormalized over all of L**, i.e. each value
+                                      is that tuple's share of the legal-set mass.
+                                      Summing all of L's `probs` gives exactly 1;
+                                      summing just the top-K gives `<= 1`, and the
+                                      gap tells you how sharp the top-K is.
     """
     if L.size == 0:
         raise ValueError("joint_topk_tuples: legal-tuple table L is empty")
     k = min(int(k), L.shape[0])
     scores = _score_tuples(probs, L)                           # (B, num_legal)
+    probs_renorm = _renormalize_over_L(scores)                 # (B, num_legal), sums to 1
 
     if k == L.shape[0]:
         order_full = np.argsort(-scores, axis=-1)
@@ -177,9 +202,10 @@ def joint_topk_tuples(
         order = np.argsort(-partial_scores, axis=-1)
         topk_idx = np.take_along_axis(partial, order, axis=-1)
 
-    topk_scores = np.take_along_axis(scores, topk_idx, axis=-1).astype(np.float32)
-    topk_tuples = L[topk_idx].astype(np.int32)                 # (B, k, 4)
-    return topk_tuples, topk_scores
+    topk_log_probs = np.take_along_axis(scores,       topk_idx, axis=-1).astype(np.float32)
+    topk_probs     = np.take_along_axis(probs_renorm, topk_idx, axis=-1).astype(np.float32)
+    topk_tuples    = L[topk_idx].astype(np.int32)              # (B, k, 4)
+    return topk_tuples, topk_log_probs, topk_probs
 
 
 def summarize_legal_tuples(L: np.ndarray, target_encoders: dict) -> dict:

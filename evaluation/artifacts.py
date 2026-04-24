@@ -80,13 +80,16 @@ def write_predictions_csv(
     pred_duration: np.ndarray,
     hierarchy_valid: np.ndarray,   # (n, K) bool
     tuple_topk_labels: np.ndarray | None = None,   # (n, K, top_k, 4) str; HIERARCHY order on last axis
-    tuple_topk_logprob: np.ndarray | None = None,  # (n, K, top_k) float
+    tuple_topk_logprob: np.ndarray | None = None,  # (n, K, top_k) float, raw joint log-prob
+    tuple_topk_prob: np.ndarray | None = None,     # (n, K, top_k) float, renormalized over L
 ) -> Path:
     """One row per (sequence_idx, step). Large but grep-friendly.
 
     When `tuple_topk_labels` is provided (constrained AR path), additional
     columns `pred_tuple_{i}_{phase,phase_step,major_ops_code,operation}` +
-    `pred_tuple_{i}_logprob` are emitted for i in 0..K-1. The per-head
+    `pred_tuple_{i}_logprob` (raw joint log-prob) + `pred_tuple_{i}_prob`
+    (renormalized over L, so one row's top-K probs sum to <= 1 and all-of-L
+    probs sum to exactly 1) are emitted for i in 0..K-1. The per-head
     pred_{head}_top1 / pred_{head}_top3 columns stay populated (they come
     from the coordinated tuple's first / top-K rows under constraints) so
     downstream consumers don't break.
@@ -126,6 +129,10 @@ def write_predictions_csv(
                     row[f"pred_tuple_{i}_logprob"] = round(
                         float(tuple_topk_logprob[seq, step, i]), 4
                     )
+                    if tuple_topk_prob is not None:
+                        row[f"pred_tuple_{i}_prob"] = round(
+                            float(tuple_topk_prob[seq, step, i]), 4
+                        )
                 # Did the ground-truth tuple appear in the top-K legal tuples?
                 true_tup = tuple(true_labels[h][seq, step] for h in HIERARCHY if h in true_labels)
                 if len(true_tup) == 4:

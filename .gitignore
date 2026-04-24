@@ -46,11 +46,12 @@ __pycache__/
 # ---------------------------------------------------------------------------
 # NOTE on *.md: we deliberately do NOT blanket-exclude .md files because some are
 # code-critical (llm/prompts/system_prompt.md + constraints.md are loaded at
-# runtime) and the improvements/*.md design docs are cross-session references.
-# Exclude explicitly instead.
+# runtime). Exclude scratch / WIP docs explicitly.
 /prompts.md
 /End to End Prediction prompt.md
 misc/exploration.md
+# Design docs and working notes — local-only, not shipped to GitHub or Colab.
+improvements/
 
 # ---------------------------------------------------------------------------
 # Analysis artifacts that contain data-derived outputs

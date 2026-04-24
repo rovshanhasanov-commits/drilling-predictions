@@ -186,12 +186,14 @@ def test_joint_topk_tuples_returns_sorted_desc_logprobs():
         "operation":      np.array([[0.65, 0.35]]),
     }
 
-    tuples, scores = joint_topk_tuples(probs, L, k=3)
+    tuples, log_probs, renorm_probs = joint_topk_tuples(probs, L, k=3)
     assert tuples.shape == (1, 3, 4)
-    assert scores.shape == (1, 3)
+    assert log_probs.shape == (1, 3)
+    assert renorm_probs.shape == (1, 3)
 
-    # Scores should be strictly non-increasing.
-    assert scores[0, 0] >= scores[0, 1] >= scores[0, 2]
+    # Log-probs (and therefore renorm probs) must be strictly non-increasing.
+    assert log_probs[0, 0] >= log_probs[0, 1] >= log_probs[0, 2]
+    assert renorm_probs[0, 0] >= renorm_probs[0, 1] >= renorm_probs[0, 2]
 
     # Top-1 must equal joint_argmax's pick.
     expected_top1 = joint_argmax(probs, L)
@@ -202,9 +204,62 @@ def test_joint_topk_tuples_clips_k_to_L_size():
     L = np.array([[0, 0, 0, 0], [1, 1, 1, 1]], dtype=np.int32)
     probs = {h: np.array([[0.5, 0.5]]) for h in HIERARCHY}
 
-    tuples, scores = joint_topk_tuples(probs, L, k=10)   # k > len(L)
+    tuples, log_probs, renorm_probs = joint_topk_tuples(probs, L, k=10)   # k > len(L)
     assert tuples.shape == (1, 2, 4)
-    assert scores.shape == (1, 2)
+    assert log_probs.shape == (1, 2)
+    assert renorm_probs.shape == (1, 2)
+
+
+def test_joint_topk_tuples_renorm_sums_to_one_over_full_L():
+    """When k == |L|, the returned renorm_probs must sum to 1.0 per row (up to fp)."""
+    L = np.array([
+        [0, 0, 0, 0],
+        [1, 1, 1, 1],
+        [0, 1, 0, 1],
+    ], dtype=np.int32)
+
+    probs = {
+        "phase":          np.array([[0.55, 0.45], [0.10, 0.90]]),
+        "phase_step":     np.array([[0.70, 0.30], [0.25, 0.75]]),
+        "major_ops_code": np.array([[0.60, 0.40], [0.20, 0.80]]),
+        "operation":      np.array([[0.65, 0.35], [0.15, 0.85]]),
+    }
+
+    _, _, renorm_probs = joint_topk_tuples(probs, L, k=L.shape[0])
+    row_sums = renorm_probs.sum(axis=-1)
+    assert np.allclose(row_sums, 1.0, atol=1e-5), f"rows sum to {row_sums}, expected 1.0"
+
+
+def test_joint_topk_tuples_renorm_top_k_sum_lt_one_when_truncated():
+    """With k < |L|, summed renorm probs should be <= 1 (missing tail mass)."""
+    L = np.array([[0, 0, 0, 0], [1, 1, 1, 1], [0, 1, 0, 1], [1, 0, 1, 0]], dtype=np.int32)
+    # Near-uniform probs → mass spreads across all 4 tuples, so top-2 sum < 1.
+    probs = {h: np.array([[0.5, 0.5]]) for h in HIERARCHY}
+
+    _, _, renorm_probs = joint_topk_tuples(probs, L, k=2)
+    row_sum = renorm_probs.sum(axis=-1)[0]
+    assert 0.0 < row_sum < 1.0, f"top-2 sum should be <1 for uniform priors, got {row_sum}"
+
+
+def test_joint_topk_tuples_renorm_matches_manual_softmax():
+    """Renormalized probs must equal softmax(scores) over L."""
+    L = np.array([[0, 0, 0, 0], [1, 1, 1, 1], [0, 1, 0, 1]], dtype=np.int32)
+    probs = {
+        "phase":          np.array([[0.6, 0.4]]),
+        "phase_step":     np.array([[0.7, 0.3]]),
+        "major_ops_code": np.array([[0.5, 0.5]]),
+        "operation":      np.array([[0.8, 0.2]]),
+    }
+
+    _, log_probs_top, renorm_top = joint_topk_tuples(probs, L, k=L.shape[0])
+
+    # Manual softmax over the raw log-probs.
+    lp = log_probs_top[0]                       # (3,)
+    m = lp.max()
+    exp_shifted = np.exp(lp - m)
+    manual = exp_shifted / exp_shifted.sum()
+
+    assert np.allclose(renorm_top[0], manual, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------

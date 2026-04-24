@@ -84,7 +84,11 @@ def autoregressive_predict(
           so legacy callers work, but the result dict also includes:
             - 'tuple_pred':          (batch, N_future, 4)     chosen legal tuple per step
             - 'tuple_topk':          (batch, N_future, K, 4)  top-K legal tuples per step
-            - 'tuple_topk_logprob':  (batch, N_future, K)     joint log-probs
+            - 'tuple_topk_logprob':  (batch, N_future, K)     raw joint log-probs
+            - 'tuple_topk_prob':     (batch, N_future, K)     probabilities
+                                                              RENORMALIZED over all legal
+                                                              tuples (sum over full L == 1,
+                                                              sum over just top-K <= 1).
         - The winning tuple's class ids feed back as next-step decoder inputs —
           this is what prevents mid-sequence drift (vs. independent per-head argmax).
     """
@@ -110,6 +114,7 @@ def autoregressive_predict(
         tuple_pred          = np.zeros((n_samples, n_future, 4), dtype=np.int32)
         tuple_topk          = np.zeros((n_samples, n_future, K_tuple, 4), dtype=np.int32)
         tuple_topk_logprob  = np.zeros((n_samples, n_future, K_tuple), dtype=np.float32)
+        tuple_topk_prob     = np.zeros((n_samples, n_future, K_tuple), dtype=np.float32)
 
     prev_cat = {t: np.full((n_samples, 1), n_classes[t], dtype=np.int32) for t in active_targets}
     prev_dur = np.zeros((n_samples, 1), dtype=np.float32) if predict_duration else None
@@ -136,9 +141,10 @@ def autoregressive_predict(
 
         if use_constraints:
             # Joint top-K first (argmax = top-1).
-            tk_tuples, tk_scores = joint_topk_tuples(step_probs, legal_tuples, K_tuple)
+            tk_tuples, tk_log_probs, tk_probs = joint_topk_tuples(step_probs, legal_tuples, K_tuple)
             tuple_topk[:, step, :, :]       = tk_tuples
-            tuple_topk_logprob[:, step, :]  = tk_scores
+            tuple_topk_logprob[:, step, :]  = tk_log_probs
+            tuple_topk_prob[:, step, :]     = tk_probs
             chosen = tk_tuples[:, 0, :]                          # (batch, 4)
             tuple_pred[:, step, :] = chosen
             for i, t in enumerate(HIERARCHY):
@@ -168,4 +174,5 @@ def autoregressive_predict(
         out["tuple_pred"]         = tuple_pred
         out["tuple_topk"]         = tuple_topk
         out["tuple_topk_logprob"] = tuple_topk_logprob
+        out["tuple_topk_prob"]    = tuple_topk_prob
     return out

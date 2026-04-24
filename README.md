@@ -10,18 +10,22 @@ plan with final operation codes and durations summing to 24 hours.
 ```
 config/            ← pipeline.yaml (single source of truth) + loader
 preprocessing/     ← joins Master_Data_With_ID + Comment_Features, engineers features, encodes, splits, saves
-training/          ← sequence builder (single target shift, EOO padding), model, SS loop, eval, notebook
-inference/         ← (well, date) → MLOutput with top-K per step
+training/          ← sequence builder (single target shift, EOO padding), model, SS loop, constraint decoder, eval, notebook
+inference/         ← (well, date) → MLOutput with top-K legal tuples per step
+evaluation/        ← offline eval CLI + artifacts + Colab-runnable report notebook
 llm/               ← prompts + Claude client + similar-wells + ML→LLM orchestration
 ui/                ← thin Streamlit layer (sidebar + actual/predicted panels)
 models/            ← trained model bundle (written by training, read by inference)
+results/           ← eval runs grouped by model folder → eval_{timestamp}/ with summary.json, predictions.csv, etc.
+improvements/      ← design docs for in-flight or planned changes (Constraint Decoder, Duration Binning)
+tests/             ← pure-numpy unit tests for training/constraints.py
 ```
 
 Stages are intentionally decoupled. The contracts:
 
 - **Preprocessing → Training/Inference**: parquet + encoders.pkl + config.json per strategy under `Data/Data for model (E2E)/{strategy}/`.
-- **Training → Inference**: bundle under `models/seq2seq_N{seq_len}_K{n_future}_T{target_count}_lr{lr}_p{patience}_{strategy}/` (`encoder_model.keras`, `decoder_step_model.keras`, `encoders.pkl`, `data_config.json`, `model_config.json`).
-- **Inference → LLM**: [`inference.contract.MLOutput`](inference/contract.py) with `steps: list[StepPrediction]` — each step has top-K labels+probs for all four hierarchy levels plus a duration.
+- **Training → Inference**: bundle under `models/seq2seq_N{seq_len}_K{n_future}_T{target_count}_lr{lr}_p{patience}_{strategy}/` (`encoder_model.keras`, `decoder_step_model.keras`, `training_model.keras`, `encoders.pkl`, `data_config.json`, `model_config.json`). Legal-tuple table is rebuilt at bundle load from the parquets — not pickled — so it's always fresh.
+- **Inference → LLM**: [`inference.contract.MLOutput`](inference/contract.py) with `steps: list[StepPrediction]`. Each step carries `topk_tuples: list[HierarchyTuple]` — each tuple has (phase, phase_step, major_ops_code, operation) guaranteed legal under the constraint decoder, plus `log_prob` (raw joint) and `prob` (renormalized over the legal set). `duration_hours` is a per-step scalar.
 - **LLM → UI**: a dict `{ops_summary, reasoning, operations: [...]}` with durations summing to 24h (± tolerance).
 
 ## Critical bug fixed — single target shift
@@ -58,6 +62,40 @@ those output positions is zeroed. Phase_Step is never masked. The SME list
 lives at `preprocessing.unplanned_operations` in `pipeline.yaml` and is
 straightforward to edit.
 
+## Constraint decoder
+
+The four hierarchy heads are trained as independent softmaxes — nothing
+couples them. Per-head argmax can produce illegal tuples (e.g. `(DRL, RIH,
+CEMENT, CIRC)` where `RIH` isn't a legal step under `DRL`). Under the constraint
+decoder:
+
+1. The **legal-tuple table** `L` is enumerated at bundle load from `train ∪ val
+   ∪ test` parquet data — treated as domain knowledge, not a leakage surface.
+   Excludes the `UNK` / `Unplanned` sentinels on the op axis (the head is
+   trained never to emit those). The EOO tuple `(EOO, EOO, EOO, EOO)` is
+   explicitly added.
+2. At each decoder step we do **joint argmax over L** — pick the single legal
+   tuple whose summed 4-head log-prob is highest. The winning tuple's class ids
+   feed back as the *next* step's decoder inputs, so autoregressive history
+   stays coordinated across the horizon.
+3. The top-K result is **K legal tuples** per step (not top-K per head) — both
+   in the eval artifacts and the LLM prompt.
+
+Turn off for ablations via `inference.enforce_hierarchy: false` in yaml, or
+`--no-constraints` on `evaluation.run_evaluation`. When off, the pipeline falls
+back to independent per-head argmax (legacy behavior).
+
+**Probability semantics**:
+- `log_prob` = raw joint log-prob (sum of 4 head log-probs). `exp(log_prob)`
+  for a tuple is ≤ `P_legal` ≤ 1; gap below 1 tells you how much mass the
+  model placed on illegal combos. Useful as a dist-shift signal.
+- `prob` = the same probability renormalized across all of L. All legal
+  tuples at one step sum to 1; surfaced top-K sums to ≤ 1. The gap = diffuseness
+  of the unsurfaced tail. This is the human-readable number in LLM prompts,
+  UI debug tables, and `predictions.csv`.
+
+Design doc: [improvements/Constraint Decoder.md](improvements/Constraint%20Decoder.md).
+
 ## Usage
 
 Install deps (see `requirements.txt`):
@@ -93,7 +131,21 @@ The notebook's final cell saves the model bundle to
 rate and early-stopping patience so multiple runs with different hyperparameters
 coexist without clobbering.
 
-### 3. Regenerate constraints (once after preprocessing)
+The notebook also contains a **cell-1 Colab bootstrap** (mounts Drive, clones
+the repo via `GITHUB_PAT` Colab Secret, symlinks `Data/models/results` to Drive)
+so you can open the notebook directly from GitHub in Colab. And a final
+subprocess cell that runs `evaluation.run_evaluation` on the fresh bundle right
+after training completes.
+
+### 3. Runtime config overrides
+
+Cell 4 of `train_seq2seq.ipynb` is the **in-notebook override block**. Mutate
+`tcfg` in memory (learning rate, strategy, loss weights, target heads, etc.)
+without editing `pipeline.yaml`. Yaml stays the canonical baseline; overrides
+are session-local. The subprocess eval in section 7 reads `model_dir` from the
+in-memory `cfg`, so overrides flow through to eval without re-reading yaml.
+
+### 4. Regenerate constraints (once after preprocessing)
 
 ```bash
 python -m llm.generate_constraints
@@ -101,15 +153,40 @@ python -m llm.generate_constraints
 
 Writes `llm/prompts/constraints.md` from `Master_Data_With_ID.csv`.
 
-### 4. Run the UI
+### 5. Evaluation
+
+```bash
+python -m evaluation.run_evaluation                           # test split, constraints on (default)
+python -m evaluation.run_evaluation --split val
+python -m evaluation.run_evaluation --no-constraints          # unconstrained ablation
+python -m evaluation.run_evaluation --limit 500 --no-csv      # smoke test
+python -m evaluation.run_evaluation --wells A,B               # substring filter
+```
+
+Writes to `results/{model_folder}/eval_{timestamp}/`:
+- `summary.json` — headline numbers (TF vs AR top-1/top-3, step1→stepK drop, hierarchy_validity_rate, conditional_acc, tuple_top{K}_overall, duration metrics if predict_duration).
+- `per_step_accuracy.csv` — tidy (head, mode, step) rows.
+- `confusion_{head}.csv` — top confused pairs per head.
+- `per_well_accuracy.csv` — per-well top-1 + duration MAE; detects domain shift across wells.
+- `predictions.csv` — one row per (sequence, step). Under constraints, includes `pred_tuple_{i}_{phase,phase_step,major_ops_code,operation}` + `pred_tuple_{i}_logprob` + `pred_tuple_{i}_prob` columns for i in 0..K-1, plus `tuple_in_topk` bool.
+- `run_config.json` — CLI args + frozen model_config for reproducibility.
+
+Then open [evaluation/eval_report.ipynb](evaluation/eval_report.ipynb) (runs in
+Colab or locally) and point `EVAL_DIR` at an `eval_*/` folder. Renders
+per-step accuracy curves, TF→AR gap, conditional accuracy, tuple top-K hit
+rate + cumulative mass, confusion pairs, per-well distribution, and (when
+enabled) duration regression metrics.
+
+### 6. Run the UI
 
 ```bash
 streamlit run ui/app.py
 ```
 
 Select a well, a date, click **Predict Next Day**. The right panel shows the
-LLM's final plan. Expand **ML stage — top-K per step (debug)** to inspect what
-the ML stage passed to the LLM.
+LLM's final plan. Expand **ML stage — top-K tuples per step (debug)** to
+inspect what the ML stage passed to the LLM (each row shows one ranked
+hierarchy tuple with its `prob` and `logP`).
 
 ## Iterating on one stage only
 
@@ -117,21 +194,26 @@ Each folder is independently iterable so long as the contract (above) holds:
 
 - Change preprocessing features? Edit `config/pipeline.yaml::features` and `preprocessing/features.py`. Re-run preprocessing, re-train.
 - Change the unplanned-operations list? Edit `config/pipeline.yaml::preprocessing::unplanned_operations`. Re-run preprocessing (the list becomes a merged `Unplanned` class + loss-mask flags), re-train.
-- Change the model? Edit `training/model.py` + `config/pipeline.yaml::training`. Re-run the notebook. The saved bundle is a drop-in for inference.
+- Change the model? Edit `training/model.py` + `config/pipeline.yaml::training`. Re-run the notebook. The saved bundle is a drop-in for inference. (Note: the duration head uses `Reshape` — not an inline `Lambda` — so `.keras` save/load round-trips cleanly when `duration_next` is enabled.)
+- Change the constraint decoder? Edit `training/constraints.py`. Toggle on/off via `config/pipeline.yaml::inference::enforce_hierarchy`. No retraining required — `L` is rebuilt at bundle load from parquets.
+- Change top-K shown to the LLM? Edit `config/pipeline.yaml::inference::top_k_tuples`. No retraining.
 - Change which ML outputs the LLM sees? Edit `config/pipeline.yaml::llm::ml_fields_to_include`. No retraining.
 - Iterate on the prompt? Edit `llm/prompts/system_prompt.md`. The UI's sidebar also has a live editor.
 
 ## Verification checklist
 
 1. **Preprocessing**: `python -m preprocessing.run_preprocessing` → three strategy folders with df_train/val/test.parquet + encoders.pkl + config.json. `n_classes` adds two sentinels (EOO + UNK) on every head; the operation head adds one further merged `Unplanned` class. Parquets carry `op_label_real`, `moc_label_real`, `dur_label_real` flags (float32, 1.0=train, 0.0=loss-mask).
-2. **Training**: notebook runs to completion; top-3 > top-1 per step; the `models/seq2seq_N{n}_K{k}_T{t}_lr{lr}_p{p}_{strategy}/` bundle directory is populated.
-3. **Inference**: `python -c "from inference.predict import predict; from config import load_config; cfg = load_config(); out = predict('<well>', '<date>', cfg=cfg); print(out.to_dict())"` → MLOutput with `n_future` StepPredictions (currently 8), top-3 per level. The first predicted step corresponds to the op **immediately after** the selected window (not one-off).
-4. **LLM**: `streamlit run ui/app.py`, pick a well+date, click Predict. Both panels render. Totals sum to ~24h.
-5. **Shift regression**: pick a test well+date where the next day's actuals are known; manually diff against the MLOutput's step-1 prediction to confirm no double-shift.
-6. **EOO sanity**: on a well near its end, verify `EOO` appears in top-K of late steps in the ML debug table.
+2. **Training**: notebook runs to completion; top-3 > top-1 per step; the `models/seq2seq_N{n}_K{k}_T{t}_lr{lr}_p{p}_{strategy}/` bundle directory is populated with `training_model.keras`, `encoder_model.keras`, `decoder_step_model.keras`, `encoders.pkl`, `data_config.json`, `model_config.json`.
+3. **Constraint decoder**: eval `summary.json::ar.hierarchy_validity_rate == 1.0` under constraints. `summary.json::ar.tuple_top{K}_overall` shows the rate at which the ground-truth tuple appears in the surfaced top-K. `summary.json::n_legal_tuples` in the low thousands.
+4. **Inference**: `python -c "from inference.predict import predict; from config import load_config; cfg = load_config(); out = predict('<well>', '<date>', cfg=cfg); print(out.to_dict())"` → MLOutput with `n_future` StepPredictions (currently 8), each with `topk_tuples` sorted by `prob` desc. The first predicted step corresponds to the op **immediately after** the selected window (not one-off).
+5. **LLM**: `streamlit run ui/app.py`, pick a well+date, click Predict. Both panels render. Totals sum to ~24h. Debug table shows top-K legal tuples with `prob` / `logP`.
+6. **Shift regression**: pick a test well+date where the next day's actuals are known; manually diff against the MLOutput's step-1 prediction to confirm no double-shift.
+7. **EOO sanity**: on a well near its end, verify the EOO tuple appears in top-K of late steps in the ML debug table.
+8. **Tests**: `python -m pytest tests/test_constraints.py -v` → 12 passing (legal-tuple construction, sentinel exclusion, joint argmax, top-K ordering, renormalized probs sum to 1 over L).
 
 ## Out of scope
 
 - `comment_parser.py` (LLM-based extraction from drilling comments) is treated as upstream — the new pipeline reads the already-extracted `Data/Comment_Features.csv`.
 - TF-IDF embeddings for similar-well lookup are reused from `LLM-powered predictions/embeddings/` (no regeneration here).
 - Productionization / auth / multi-user state.
+- Duration binning (classification head replacing regression) — designed in [improvements/Duration Binning.md](improvements/Duration%20Binning.md), not yet implemented.

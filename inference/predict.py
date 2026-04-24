@@ -130,16 +130,18 @@ def predict(
             # Batch-dim = 1; joint_topk_tuples expects (B, n_classes) per head.
             probs_batched = {t: level_probs[t][None, :] for t in HIERARCHY}
             from training.constraints import joint_topk_tuples       # local to dodge TF import cost at module load
-            tk_tuples, tk_scores = joint_topk_tuples(probs_batched, legal_tuples, k)
-            tk_tuples = tk_tuples[0]                                 # (K, 4)
-            tk_scores = tk_scores[0]                                 # (K,)
+            tk_tuples, tk_log_probs, tk_probs = joint_topk_tuples(probs_batched, legal_tuples, k)
+            tk_tuples    = tk_tuples[0]                              # (K, 4)
+            tk_log_probs = tk_log_probs[0]                           # (K,)
+            tk_probs     = tk_probs[0]                               # (K,) renormalized over L
             topk_tuples = [
                 HierarchyTuple(
                     phase          = str(target_encoders["phase"].classes_[tk_tuples[i, 0]]),
                     phase_step     = str(target_encoders["phase_step"].classes_[tk_tuples[i, 1]]),
                     major_ops_code = str(target_encoders["major_ops_code"].classes_[tk_tuples[i, 2]]),
                     operation      = str(target_encoders["operation"].classes_[tk_tuples[i, 3]]),
-                    log_prob       = float(tk_scores[i]),
+                    log_prob       = float(tk_log_probs[i]),
+                    prob           = float(tk_probs[i]),
                 )
                 for i in range(tk_tuples.shape[0])
             ]
@@ -155,6 +157,8 @@ def predict(
             topk_tuples = []
             # Build K "tuples" by zipping each head's top-K. Joint log-prob is
             # just the sum of the per-head log-probs (not a true joint under L).
+            # `prob` here is exp(log_prob) — raw joint under independence — since
+            # there is no legal set to renormalize against.
             for i in range(k):
                 row = {t: order[t][min(i, len(order[t]) - 1)] for t in HIERARCHY}
                 lp = sum(
@@ -166,6 +170,7 @@ def predict(
                     major_ops_code = str(target_encoders["major_ops_code"].classes_[row["major_ops_code"]]),
                     operation      = str(target_encoders["operation"].classes_[row["operation"]]),
                     log_prob       = lp,
+                    prob           = float(np.exp(lp)),
                 ))
             for t in HIERARCHY:
                 prev_cat[t] = np.array([[int(order[t][0])]], dtype=np.int32)

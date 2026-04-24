@@ -78,10 +78,13 @@ def context_ml_predictions(ml: MLOutput, fields: Iterable[str]) -> str:
         "Each step lists the top-K (phase / phase_step / major_ops_code / operation) "
         "combinations the model judged most likely. Every tuple is guaranteed "
         "consistent with the drilling hierarchy (the ML stage already validated "
-        "against Context 3). `logP` is the joint log-probability across all four "
-        "heads — closer to zero means higher confidence."
+        "against Context 3). `prob` is the model's confidence in that tuple as "
+        "a share of the legal-set probability mass (all legal tuples at a step "
+        "sum to 1; top-K sums to <= 1 and the gap tells you how diffuse the tail "
+        "is). `logP` is the raw joint log-probability (useful for diagnostics; "
+        "closer to zero = higher confidence across all 4 heads)."
     )
-    header_cells = ["Step", "Rank"] + [f.capitalize() for f in level_fields] + ["logP"]
+    header_cells = ["Step", "Rank"] + [f.capitalize() for f in level_fields] + ["prob", "logP"]
     if show_dur:
         header_cells.append("Dur_hrs")
     lines.append("| " + " | ".join(header_cells) + " |")
@@ -92,6 +95,7 @@ def context_ml_predictions(ml: MLOutput, fields: Iterable[str]) -> str:
             row = [str(s.step + 1), str(i + 1)]
             for f in level_fields:
                 row.append(str(getattr(tup, f)))
+            row.append(f"{tup.prob:.3f}")
             row.append(f"{tup.log_prob:.2f}")
             if show_dur:
                 row.append(f"{s.duration_hours:.2f}" if i == 0 else "")

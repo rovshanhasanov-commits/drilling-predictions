@@ -50,8 +50,11 @@ def _render_ops_table(ops: list[dict], duration_tol: float):
 def _render_ml_debug(ml_output):
     """Flatten the MLOutput into a top-K legal-tuple debug table.
 
-    Each step expands into K rows, one per ranked hierarchy tuple. Duration
-    is a per-step scalar, shown only on rank-1 so the table stays readable.
+    Each step expands into K rows, one per ranked hierarchy tuple. `prob` is
+    the tuple's share of the legal-set probability mass (all legal tuples at
+    a step sum to 1). `logP` is the raw joint log-prob — useful for spotting
+    low-confidence steps even when top-K probs look similar. Duration is a
+    per-step scalar, shown only on rank-1 so the table stays readable.
     """
     rows = []
     for s in ml_output.steps:
@@ -63,6 +66,7 @@ def _render_ml_debug(ml_output):
                 "Phase_Step": tup.phase_step,
                 "Major_Ops_Code": tup.major_ops_code,
                 "Operation": tup.operation,
+                "prob": round(tup.prob, 3),
                 "logP": round(tup.log_prob, 3),
                 "Dur (hrs)": round(s.duration_hours, 2) if rank == 1 else None,
             })

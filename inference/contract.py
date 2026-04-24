@@ -19,12 +19,28 @@ from typing import List
 
 @dataclass
 class HierarchyTuple:
-    """One legal (phase, phase_step, major_ops_code, operation) candidate."""
+    """One legal (phase, phase_step, major_ops_code, operation) candidate.
+
+    `log_prob` is the raw joint log-probability (sum of the 4 head log-probs).
+    `exp(log_prob)` is the joint probability under independence, <= P_legal <= 1
+    across the full legal set — useful as a confidence health signal.
+
+    `prob` is that same probability **renormalized over the legal set L**: each
+    tuple's share of the legal-set mass. Summing `prob` across all legal tuples
+    for a given step equals 1.0 exactly; summing just the surfaced top-K gives
+    <= 1 and the gap tells you how concentrated the distribution is. This is
+    the number to show humans / LLMs when you want an intuitive "how confident
+    is the model about this option among all legal next ops".
+
+    Under unconstrained decoding (constraint decoder off), `prob` falls back to
+    `exp(log_prob)` — the raw joint under independence, no renormalization.
+    """
     phase:          str
     phase_step:     str
     major_ops_code: str
     operation:      str
-    log_prob:       float            # joint log-prob under the model (sum over 4 heads)
+    log_prob:       float            # raw joint log-prob (sum over 4 heads)
+    prob:           float            # renormalized over L (legal set); in [0, 1]
 
 
 @dataclass
@@ -46,6 +62,7 @@ class StepPrediction:
             "operation":      t.operation,
             "duration_hours": self.duration_hours,
             "log_prob":       t.log_prob,
+            "prob":           t.prob,
         }
 
 
