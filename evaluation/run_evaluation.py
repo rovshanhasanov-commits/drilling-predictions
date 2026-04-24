@@ -328,7 +328,7 @@ def main():
 
     # -- build summary --
     summary = {
-        "model_folder": model_folder_name(cfg),
+        "model_folder": _effective_model_folder_name(cfg, args),
         "evaluated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "split": args.split,
         "n_sequences": int(seq["num"].shape[0]),
@@ -397,10 +397,28 @@ def _trim_sequence_bundle(seq: dict, limit: int, cat_cols: list[str], target_col
     return trimmed
 
 
+def _effective_model_folder_name(cfg: dict, args) -> str:
+    """Folder name for the model being evaluated.
+
+    When `--model-dir` is passed (as the training notebook's post-train eval
+    subprocess does), derive the name from the bundle path so the eval artifacts
+    land NEXT TO the model they actually ran against. The alternative —
+    `model_folder_name(cfg)` — would use the yaml-default cfg (the subprocess
+    re-reads yaml from disk and loses any in-memory overrides from cell 4),
+    leaking eval artifacts into a wrong / non-existent folder.
+
+    When `--model-dir` is NOT passed, fall back to the cfg-derived name (matches
+    training-notebook behavior when no overrides are in play).
+    """
+    if args.model_dir:
+        return Path(args.model_dir).resolve().name
+    return model_folder_name(cfg)
+
+
 def _build_out_dir(cfg: dict, args) -> Path:
     results_root = resolve(cfg, cfg["training"]["results_dir"])
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return results_root / model_folder_name(cfg) / f"eval_{ts}"
+    return results_root / _effective_model_folder_name(cfg, args) / f"eval_{ts}"
 
 
 if __name__ == "__main__":
