@@ -171,15 +171,25 @@ training:
   ss_ramp_epochs: 200
   batch_size:     64
   epochs:         500
-  learning_rate:  0.0001       # initial LR; the dynamic-LR schedule below can drop it further
+  learning_rate:  0.0001       # initial LR (lr_max for cosine; floor for plateau).
   early_stopping_patience: 30
-  # ReduceLROnPlateau-style: halve LR when val_loss hasn't improved for `lr_patience`
-  # epochs, floored at `min_lr`. Set lr_patience to 0 to disable.
-  lr_patience: 1
+  # LR schedule selection: "plateau" (ReduceLROnPlateau-style) or "cosine_restarts" (SGDR).
+  # See improvements/Learning rate changes and Eval fixes.md §1.
+  lr_schedule: "plateau"
+  # Plateau-mode knobs (ignored when lr_schedule != "plateau"):
+  # halve LR when val_loss hasn't improved for `lr_patience` epochs, floored at `min_lr`.
+  # Set lr_patience to 0 to disable mid-run drops.
+  lr_patience: 5
   lr_factor:   0.5
   min_lr:      1.0e-7        # note: scientific notation in YAML needs the decimal point (`1.0e-7`, not `1e-7`) to parse as float
+  # Cosine warm restarts (SGDR) knobs (ignored when lr_schedule != "cosine_restarts"):
+  # lr(epoch) = cosine_min_lr + 0.5*(learning_rate - cosine_min_lr) * (1 + cos(pi * T_cur / T_i))
+  # T_0 = first cycle length; cycle length scales by cosine_t_mult after each restart.
+  cosine_t_0:    50
+  cosine_t_mult: 2
+  cosine_min_lr: 1.0e-7
   top_k_for_eval: 3                 # user wants top-3 accuracy reported alongside top-1
-  model_dir:      "models"          # parent dir; actual bundle goes to models/seq2seq_N{n}_K{k}_T{t}_{strategy}/ (see config.get_model_dir)
+  model_dir:      "models"          # parent dir; bundle path varies by lr_schedule and ends with a training-start timestamp (see config.model_folder_name)
   results_dir:    "results"
 
 # ---------------------------------------------------------------------------
@@ -197,7 +207,7 @@ inference:
   # Requires `duration_bin_next` in `training.target_variables` (validated at load).
   # Default false: predict bin head independently first, decide on coupling once
   # bin top-1 / top-3 numbers are in.
-  include_duration_bins_in_hierarchy: true
+  include_duration_bins_in_hierarchy: false
 
 # ---------------------------------------------------------------------------
 # LLM stage — controls which ML outputs are exposed to Claude and the API call

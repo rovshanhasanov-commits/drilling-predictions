@@ -20,32 +20,59 @@ def resolve(cfg: dict, rel_path: str) -> Path:
     return (Path(cfg["_repo_root"]) / rel_path).resolve()
 
 
-def model_folder_name(cfg: dict) -> str:
+def model_folder_name(cfg: dict, timestamp: str | None = None) -> str:
     """Config-derived subfolder name so each distinct training setup has its own bundle.
 
-    Format: seq2seq_N{seq_len}_K{n_future}_T{n_targets}_lr{lr}_p{patience}_{strategy}
+    Format varies by `training.lr_schedule`:
+
+    Plateau:
+      seq2seq_N{N}_K{K}_T{T}_lr{lr}_p{patience}_plateau_lrp{lr_patience}_{strategy}_{ts}
+
+    Cosine warm restarts:
+      seq2seq_N{N}_K{K}_T{T}_lr{lr}_p{patience}_cosineWR_T0{t0}_M{tmult}_{strategy}_{ts}
+
+    Common fields:
       N        = encoder context window length
       K        = prediction horizon (number of future steps)
-      T        = number of target heads (hierarchy levels + duration if enabled)
-      lr       = learning rate (`:g` format — `0.0001` stays fixed, `1e-5` becomes scientific)
+      T        = number of target heads
+      lr       = initial learning rate (`:g` format)
       p        = early stopping patience (epochs)
       strategy = categorical embedding strategy
+      ts       = training-start timestamp (`YYYYMMDD_HHMM`); appended only when provided
+
+    `timestamp` is set by training to make every run a sibling folder. Eval / inference
+    should pass the bundle path directly via `--model-dir` rather than rederive a name.
     """
     t = cfg["training"]
-    return (
+    base = (
         f"seq2seq_N{t['sequence_length']}"
         f"_K{t['n_future']}"
         f"_T{len(t['target_variables'])}"
         f"_lr{t['learning_rate']:g}"
         f"_p{t['early_stopping_patience']}"
-        f"_{t['embedding_strategy']}"
     )
 
+    schedule = t.get("lr_schedule", "plateau")
+    if schedule == "cosine_restarts":
+        sched_part = (
+            f"_cosineWR"
+            f"_T0{int(t.get('cosine_t_0', 50))}"
+            f"_M{int(t.get('cosine_t_mult', 2))}"
+        )
+    else:
+        sched_part = f"_plateau_lrp{int(t.get('lr_patience', 0))}"
 
-def get_model_dir(cfg: dict) -> Path:
+    name = f"{base}{sched_part}_{t['embedding_strategy']}"
+    if timestamp:
+        name = f"{name}_{timestamp}"
+    return name
+
+
+def get_model_dir(cfg: dict, timestamp: str | None = None) -> Path:
     """Full resolved path to the model bundle for the current config.
 
-    Both training (to save) and inference (to load) should call this — guarantees
-    they agree on where artifacts live.
+    Pass `timestamp` at training time so each run gets its own sibling folder.
+    Eval / inference should rely on the explicit folder path on disk rather than
+    re-deriving a name (the timestamp won't round-trip).
     """
-    return resolve(cfg, cfg["training"]["model_dir"]) / model_folder_name(cfg)
+    return resolve(cfg, cfg["training"]["model_dir"]) / model_folder_name(cfg, timestamp)

@@ -24,7 +24,7 @@ tests/             ← pure-numpy unit tests for training/constraints.py
 Stages are intentionally decoupled. The contracts:
 
 - **Preprocessing → Training/Inference**: parquet + encoders.pkl + config.json per strategy under `Data/Data for model (E2E)/{strategy}/`.
-- **Training → Inference**: bundle under `models/seq2seq_N{seq_len}_K{n_future}_T{target_count}_lr{lr}_p{patience}_{strategy}/` (`encoder_model.keras`, `decoder_step_model.keras`, `training_model.keras`, `encoders.pkl`, `data_config.json`, `model_config.json`). Legal-tuple table is rebuilt at bundle load from the parquets — not pickled — so it's always fresh.
+- **Training → Inference**: bundle under `models/seq2seq_N{seq_len}_K{n_future}_T{target_count}_lr{lr}_p{patience}_{lr_schedule_tag}_{strategy}_{timestamp}/` (`encoder_model.keras`, `decoder_step_model.keras`, `training_model.keras`, `encoders.pkl`, `data_config.json`, `model_config.json`). The `lr_schedule_tag` varies by selected scheduler (`plateau_lrp{n}` vs `cosineWR_T0{t0}_M{m}`) and the timestamp ensures every run is its own sibling folder. Legal-tuple table is rebuilt at bundle load from the parquets — not pickled — so it's always fresh.
 - **Inference → LLM**: [`inference.contract.MLOutput`](inference/contract.py) with `steps: list[StepPrediction]`. Each step carries `topk_tuples: list[HierarchyTuple]` — each tuple has (phase, phase_step, major_ops_code, operation) guaranteed legal under the constraint decoder, plus `log_prob` (raw joint) and `prob` (renormalized over the legal set). `duration_hours` is a per-step scalar.
 - **LLM → UI**: a dict `{ops_summary, reasoning, operations: [...]}` with durations summing to 24h (± tolerance).
 
@@ -126,16 +126,23 @@ Evaluation reports **top-1 AND top-3** accuracy per step — if `top-3 ≫ top-1
 the user's "off by 1" hypothesis is supported.
 
 The notebook's final cell saves the model bundle to
-`models/seq2seq_N{seq_len}_K{n_future}_T{target_count}_lr{lr}_p{patience}_{strategy}/`
-(see `config.get_model_dir`). The naming embeds the window shape plus learning
-rate and early-stopping patience so multiple runs with different hyperparameters
-coexist without clobbering.
+`models/seq2seq_N{N}_K{K}_T{T}_lr{lr}_p{patience}_{lr_schedule_tag}_{strategy}_{timestamp}/`
+(see `config.model_folder_name`). The name encodes the window shape, learning
+rate, early-stopping patience, the LR schedule (plateau / cosine warm restarts)
+and a training-start timestamp — so every run is its own sibling folder and
+re-running training never clobbers an existing bundle.
+
+`model_config.json` inside the bundle captures the **full effective training
+config** (after override-cell mods), git SHA, package versions, dataset
+fingerprints, and per-epoch LR/loss history. Eval reads training-derived
+parameters from this file rather than `pipeline.yaml`, so older bundles still
+evaluate correctly even when the YAML has moved on.
 
 The notebook also contains a **cell-1 Colab bootstrap** (mounts Drive, clones
 the repo via `GITHUB_PAT` Colab Secret, symlinks `Data/models/results` to Drive)
-so you can open the notebook directly from GitHub in Colab. And a final
-subprocess cell that runs `evaluation.run_evaluation` on the fresh bundle right
-after training completes.
+so you can open the notebook directly from GitHub in Colab. Evaluation is run
+manually after copy-pasting the bundle:
+`python -m evaluation.run_evaluation --model-dir models/<bundle>`.
 
 ### 3. Runtime config overrides
 
@@ -169,7 +176,7 @@ Writes to `results/{model_folder}/eval_{timestamp}/`:
 - `confusion_{head}.csv` — top confused pairs per head.
 - `per_well_accuracy.csv` — per-well top-1 + duration MAE; detects domain shift across wells.
 - `predictions.csv` — one row per (sequence, step). Under constraints, includes:
-  - Parsed per-head: `pred_tuple_{i}_{phase,phase_step,major_ops_code,operation}` + `pred_tuple_{i}_logprob` + `pred_tuple_{i}_prob` for i in 0..K-1.
+  - Parsed per-head: `pred_tuple_{i}_{phase,phase_step,major_ops_code,operation}` + `pred_tuple_{i}_prob` for i in 0..K-1.
   - Compact state-format (analyst-friendly): `true_state`, `pred_{i}_state`, `pred_{i}_state_prob`, `pred_{i}_state_match` — `state` is `phase|phase_step|major_ops_code|operation` pipe-joined; `match` is bool.
   - `tuple_in_topk` bool — did ground-truth tuple appear anywhere in the top-K.
 - `run_config.json` — CLI args + frozen model_config for reproducibility.
@@ -206,7 +213,7 @@ Each folder is independently iterable so long as the contract (above) holds:
 ## Verification checklist
 
 1. **Preprocessing**: `python -m preprocessing.run_preprocessing` → three strategy folders with df_train/val/test.parquet + encoders.pkl + config.json. `n_classes` adds two sentinels (EOO + UNK) on every head; the operation head adds one further merged `Unplanned` class. Parquets carry `op_label_real`, `moc_label_real`, `dur_label_real` flags (float32, 1.0=train, 0.0=loss-mask).
-2. **Training**: notebook runs to completion; top-3 > top-1 per step; the `models/seq2seq_N{n}_K{k}_T{t}_lr{lr}_p{p}_{strategy}/` bundle directory is populated with `training_model.keras`, `encoder_model.keras`, `decoder_step_model.keras`, `encoders.pkl`, `data_config.json`, `model_config.json`.
+2. **Training**: notebook runs to completion; the `models/seq2seq_N{n}_K{k}_T{t}_lr{lr}_p{p}_{lr_schedule_tag}_{strategy}_{ts}/` bundle directory is populated with `training_model.keras`, `encoder_model.keras`, `decoder_step_model.keras`, `encoders.pkl`, `data_config.json`, `model_config.json`. Evaluation is run separately via `python -m evaluation.run_evaluation --model-dir <bundle>`; expect top-3 > top-1 per step in the eval summary.
 3. **Constraint decoder**: eval `summary.json::ar.hierarchy_validity_rate == 1.0` under constraints. `summary.json::ar.tuple_top{K}_overall` shows the rate at which the ground-truth tuple appears in the surfaced top-K. `summary.json::n_legal_tuples` in the low thousands.
 4. **Inference**: `python -c "from inference.predict import predict; from config import load_config; cfg = load_config(); out = predict('<well>', '<date>', cfg=cfg); print(out.to_dict())"` → MLOutput with `n_future` StepPredictions (currently 8), each with `topk_tuples` sorted by `prob` desc. The first predicted step corresponds to the op **immediately after** the selected window (not one-off).
 5. **LLM**: `streamlit run ui/app.py`, pick a well+date, click Predict. Both panels render. Totals sum to ~24h. Debug table shows top-K legal tuples with `prob` / `logP`.

@@ -34,6 +34,7 @@ from training.evaluate import autoregressive_predict, per_step_accuracy         
 from training.train import prep_encoder_inputs, prep_model_inputs                # noqa: E402
 
 from . import artifacts, metrics                                                 # noqa: E402
+from .alignment import compute_alignment, shift_along_axis1                      # noqa: E402
 
 
 def parse_args():
@@ -73,8 +74,6 @@ def _invert_duration(scaled: np.ndarray, dur_scaler) -> np.ndarray:
 def main():
     args = parse_args()
     cfg = load_config()
-    tcfg = cfg["training"]
-    icfg = cfg.get("inference", {}) or {}
 
     # -- resolve model dir and load bundle --
     model_dir = Path(args.model_dir).resolve() if args.model_dir else get_model_dir(cfg)
@@ -90,6 +89,12 @@ def main():
     dur_scaler = encoders["dur_scaler"]
     n_classes = encoders["n_classes"]
     eoo_token = encoders["eoo_token"]
+
+    # The bundle's model_config.json is the source of truth for training-derived
+    # params. When a key is missing (older bundle without schema_version 2), fall
+    # back to the current pipeline.yaml cfg with a printed warning naming each
+    # fallback. Data paths and CLI args still come from cfg / args.
+    tcfg, icfg = _hydrate_eval_cfg(model_config, cfg)
 
     strategy = tcfg["embedding_strategy"]
     strategy_dir = resolve(cfg, cfg["data"]["output_dir"]) / strategy
@@ -200,30 +205,78 @@ def main():
         legal_tuples=legal_tuples,
         include_bins=use_5d_constraints,
     )
-    ar_pred_ids = ar["pred"]                         # {head: (n, n_future)}
-    ar_topk_ids = ar["topk"]                         # {head: (n, n_future, top_k)}
+    ar_pred_ids_raw = ar["pred"]                     # {head: (n, n_future)}
+    ar_topk_ids_raw = ar["topk"]                     # {head: (n, n_future, top_k)}
 
-    # Per-head top-1 / top-K accuracy. When constraints are on, ar_pred_ids[h]
-    # comes from the winning legal tuple (coordinated across heads). topk stays
-    # per-head for diagnostics; tuple-level top-K is reported separately.
+    # -- decode raw ids -> label strings (needed for alignment computation) --
+    ar_pred_labels_raw = {h: _decode_ids(ar_pred_ids_raw[h], target_encoders[h]) for h in active_targets}
+    ar_topk_labels_raw = {h: _decode_ids(ar_topk_ids_raw[h], target_encoders[h]) for h in active_targets}
+    true_labels = {
+        h: _decode_ids(seq["y"][f"{h}_target_enc"], target_encoders[h]) for h in active_targets
+    }
+
+    # -- alignment: shift AR preds left past Unplanned/UNK truths and annotate --
+    # See evaluation/alignment.py and improvements/Learning rate changes and Eval fixes.md
+    # §2b/§2d. Replaces the old sample_weight-based AR masking — TF metrics still
+    # use sw to keep TF as a clean unconstrained upper bound.
+    pcfg = cfg.get("preprocessing", {}) or {}
+    ecfg = cfg.get("encoding", {}) or {}
+    unplanned_token = pcfg.get("unplanned_token", "Unplanned")
+    unk_token       = ecfg.get("unk_token", "UNK")
+    alignment = compute_alignment(
+        true_op_labels=true_labels["operation"],
+        raw_pred_op_labels=ar_pred_labels_raw["operation"],
+        unplanned_token=unplanned_token,
+        unk_token=unk_token,
+        eoo_token=eoo_token,
+    )
+    shift_indices = alignment["shift_indices"]
+    eval_weights  = alignment["eval_weights"]
+    n_excluded    = int(alignment["exclude"].sum())
+    print(
+        f"  alignment: {n_excluded:,} / {alignment['exclude'].size:,} positions excluded "
+        f"({n_excluded / max(alignment['exclude'].size, 1):.2%})"
+    )
+    reasons, counts = np.unique(
+        alignment["exclude_reason"][alignment["exclude"]], return_counts=True
+    )
+    for r, c in zip(reasons, counts):
+        print(f"    {r:18s} {int(c):>8,}")
+
+    # Apply the shift to every AR-side array — IDs, labels, top-K, tuples, duration.
+    ar_pred_ids = {
+        h: shift_along_axis1(ar_pred_ids_raw[h], shift_indices, fill=-1)
+        for h in active_targets
+    }
+    ar_topk_ids = {
+        h: shift_along_axis1(ar_topk_ids_raw[h], shift_indices, fill=-1)
+        for h in active_targets
+    }
+    ar_pred_labels = {
+        h: shift_along_axis1(ar_pred_labels_raw[h], shift_indices, fill="")
+        for h in active_targets
+    }
+    ar_topk_labels = {
+        h: shift_along_axis1(ar_topk_labels_raw[h], shift_indices, fill="")
+        for h in active_targets
+    }
+
+    # Per-head top-1 / top-K accuracy on shifted preds, gated by eval_weights
+    # (Unplanned/UNK/post-EOO/shift-overflow excluded). NULL preds (-1) auto-miss.
     ar_scores = {}
     for h in active_targets:
         true = seq["y"][f"{h}_target_enc"]
-        w = sw.get(h)
         top1, topk_hits = [], []
         for s in range(n_future):
             hit1 = (ar_pred_ids[h][:, s] == true[:, s])
             hitk = (ar_topk_ids[h][:, s, :] == true[:, s:s + 1]).any(axis=-1)
-            if w is not None:
-                keep = w[:, s] > 0
-                if not keep.any():
-                    top1.append(float("nan"))
-                    topk_hits.append(float("nan"))
-                    continue
-                hit1 = hit1[keep]
-                hitk = hitk[keep]
-            top1.append(float(hit1.mean()))
-            topk_hits.append(float(hitk.mean()))
+            keep = eval_weights[:, s] > 0
+            if not keep.any():
+                top1.append(float("nan"))
+                topk_hits.append(float("nan"))
+                continue
+            top1.append(float(hit1[keep].mean()))
+            topk_hits.append(float(hitk[keep].mean()))
         ar_scores[h] = {
             "per_step_top1": top1,
             "per_step_topk": topk_hits,
@@ -236,51 +289,43 @@ def main():
     # Tuple-level top-K accuracy: did the ground-truth tuple appear in the
     # chosen top-K legal tuples at this step? Only meaningful under constraints.
     tuple_topk_hit_rate = None
+    tuple_topk_ids_shifted = None
     if enforce_hierarchy and "tuple_topk" in ar:
-        tuple_topk = ar["tuple_topk"]                  # (n, n_future, K, 4)
+        tuple_topk_ids_shifted = shift_along_axis1(ar["tuple_topk"], shift_indices, fill=-1)
         y = seq["y"]
         true_stack = np.stack([y[f"{h}_target_enc"] for h in HIERARCHY], axis=-1)  # (n, n_future, 4)
-        # Use the op-head mask as the gate (matches legacy behavior: excludes
-        # masked-target rows from per-head accuracy). Tuples aren't meaningful
-        # when the op head's ground truth is masked anyway.
-        w_op = sw.get("operation")
         per_step_hits = []
         for s in range(n_future):
-            hits = (tuple_topk[:, s, :, :] == true_stack[:, s:s + 1, :]).all(axis=-1).any(axis=-1)
-            if w_op is not None:
-                keep = w_op[:, s] > 0
-                if not keep.any():
-                    per_step_hits.append(float("nan"))
-                    continue
-                hits = hits[keep]
-            per_step_hits.append(float(hits.mean()))
+            hits = (
+                tuple_topk_ids_shifted[:, s, :, :len(HIERARCHY)]
+                == true_stack[:, s:s + 1, :]
+            ).all(axis=-1).any(axis=-1)
+            keep = eval_weights[:, s] > 0
+            if not keep.any():
+                per_step_hits.append(float("nan"))
+                continue
+            per_step_hits.append(float(hits[keep].mean()))
         tuple_topk_hit_rate = {
             "per_step": per_step_hits,
             "overall":  float(np.nanmean(per_step_hits)),
         }
         print(f"  AR tuple_top{top_k}         overall={tuple_topk_hit_rate['overall']:.4f}")
 
-    # -- decode ids -> label strings for downstream reporting --
-    ar_pred_labels = {h: _decode_ids(ar_pred_ids[h], target_encoders[h]) for h in active_targets}
-    ar_topk_labels = {h: _decode_ids(ar_topk_ids[h], target_encoders[h]) for h in active_targets}
-    true_labels = {
-        h: _decode_ids(seq["y"][f"{h}_target_enc"], target_encoders[h]) for h in active_targets
-    }
-
     # Top-K tuple labels for predictions.csv (only populated under constraints).
     tuple_topk_labels = None
-    tuple_topk_logprob = None
     tuple_topk_prob = None
     if enforce_hierarchy and "tuple_topk" in ar:
         tk = ar["tuple_topk"]                          # (n, n_future, K, n_joint_heads), ids
-        tuple_topk_labels = np.empty(tk.shape, dtype=object)
+        tuple_topk_labels_raw = np.empty(tk.shape, dtype=object)
         for i, h in enumerate(HIERARCHY):
-            tuple_topk_labels[..., i] = _decode_ids(tk[..., i], target_encoders[h])
+            tuple_topk_labels_raw[..., i] = _decode_ids(tk[..., i], target_encoders[h])
         if use_5d_constraints:
             # Last column is the bin head; decode through the bin encoder.
-            tuple_topk_labels[..., 4] = _decode_ids(tk[..., 4], target_encoders["duration_bin"])
-        tuple_topk_logprob = ar["tuple_topk_logprob"]  # (n, n_future, K) raw joint log-probs
-        tuple_topk_prob    = ar["tuple_topk_prob"]     # (n, n_future, K) renormalized over L
+            tuple_topk_labels_raw[..., 4] = _decode_ids(tk[..., 4], target_encoders["duration_bin"])
+        tuple_topk_labels = shift_along_axis1(tuple_topk_labels_raw, shift_indices, fill="")
+        tuple_topk_prob = shift_along_axis1(
+            ar["tuple_topk_prob"], shift_indices, fill=float("nan")
+        )
 
     # -- duration (inverse-transform to hours) --
     # Always compute true_duration in raw hours when the bin head is on, so the
@@ -292,8 +337,9 @@ def main():
         true_duration = np.zeros_like(seq["y_dur"])
 
     if predict_duration:
-        pred_duration = _invert_duration(ar["pred"]["duration"], dur_scaler)
-        dur_stats = metrics.duration_metrics(pred_duration, true_duration, weights=sw.get("duration"))
+        pred_duration_raw = _invert_duration(ar["pred"]["duration"], dur_scaler)
+        pred_duration = shift_along_axis1(pred_duration_raw, shift_indices, fill=float("nan"))
+        dur_stats = metrics.duration_metrics(pred_duration, true_duration, weights=eval_weights)
         print(
             f"  duration  MAE={dur_stats['mae_hours']:.2f}h  "
             f"MedAE={dur_stats['medae_hours']:.2f}h  p95={dur_stats['p95_abs_err_hours']:.2f}h"
@@ -309,7 +355,7 @@ def main():
         bin_centers_dict = encoders.get("bin_centers") or {}
         bin_stats = metrics.bin_center_mae(
             ar_pred_ids["duration_bin"], true_duration, bin_centers_dict,
-            bin_classes, weights=sw.get("duration_bin"),
+            bin_classes, weights=eval_weights,
         )
         print(
             f"  duration_bin  center_MAE={bin_stats['bin_center_mae_hours']:.2f}h  "
@@ -332,17 +378,17 @@ def main():
         "phase_step_given_phase": metrics.conditional_accuracy(
             ar_pred_ids["phase"], seq["y"]["phase_target_enc"],
             ar_pred_ids["phase_step"], seq["y"]["phase_step_target_enc"],
-            weights=sw.get("phase_step"),
+            weights=eval_weights,
         ),
         "moc_given_phase_step": metrics.conditional_accuracy(
             ar_pred_ids["phase_step"], seq["y"]["phase_step_target_enc"],
             ar_pred_ids["major_ops_code"], seq["y"]["major_ops_code_target_enc"],
-            weights=sw.get("major_ops_code"),
+            weights=eval_weights,
         ),
         "operation_given_moc": metrics.conditional_accuracy(
             ar_pred_ids["major_ops_code"], seq["y"]["major_ops_code_target_enc"],
             ar_pred_ids["operation"], seq["y"]["operation_target_enc"],
-            weights=sw.get("operation"),
+            weights=eval_weights,
         ),
     }
     print(f"  conditional_acc = {cond}")
@@ -353,13 +399,13 @@ def main():
         class_labels = list(target_encoders[h].classes_)
         confusion_dfs[h] = metrics.top_confused_pairs(
             seq["y"][f"{h}_target_enc"], ar_pred_ids[h], class_labels, top_n=20,
-            weights=sw.get(h),
+            weights=eval_weights,
         )
 
     # -- per-well aggregation --
-    pw_weights = {h: sw[h] for h in active_targets if h in sw}
-    if predict_duration and "duration" in sw:
-        pw_weights["duration"] = sw["duration"]
+    pw_weights = {h: eval_weights for h in active_targets}
+    if predict_duration:
+        pw_weights["duration"] = eval_weights
     per_well_df = metrics.per_well_accuracy(
         seq["wells"], ar_pred_ids, {h: seq["y"][f"{h}_target_enc"] for h in active_targets},
         pred_duration if predict_duration else None,
@@ -424,14 +470,67 @@ def main():
             true_labels, {h: ar_pred_labels[h] for h in active_targets}, ar_topk_labels,
             true_duration, pred_duration, hier_valid,
             tuple_topk_labels=tuple_topk_labels,
-            tuple_topk_logprob=tuple_topk_logprob,
             tuple_topk_prob=tuple_topk_prob,
             bin_centers=encoders.get("bin_centers"),
             include_bins_in_tuples=use_5d_constraints,
+            planned_step=alignment["planned_step"],
+            exclude=alignment["exclude"],
+            exclude_reason=alignment["exclude_reason"],
         )
 
     print("\nDone.")
     return 0
+
+
+_TRAINING_KEYS_FROM_BUNDLE = (
+    "embedding_strategy", "sequence_length", "n_future",
+    "target_variables", "top_k_for_eval",
+)
+_INFERENCE_KEYS_FROM_BUNDLE = (
+    "enforce_hierarchy", "include_duration_bins_in_hierarchy",
+)
+
+
+def _hydrate_eval_cfg(model_config: dict, cfg: dict) -> tuple[dict, dict]:
+    """Build (tcfg, icfg) for eval, prioritizing the bundle's model_config.json.
+
+    `model_config["effective_cfg"]["training" | "inference"]` is the authoritative
+    source for training-derived knobs (the cfg snapshot at training time, after
+    any Colab override-cell mods). For each expected key missing from the bundle
+    we fall back to the current pipeline.yaml cfg and print a warning naming the
+    fallback — surfaces stale bundles loudly without hard-failing.
+
+    Data paths and CLI args still come from `cfg` / argparse — they describe
+    where to look now, not what was trained.
+    """
+    eff = (model_config or {}).get("effective_cfg") or {}
+    bundle_tcfg = (eff.get("training") or {})
+    bundle_icfg = (eff.get("inference") or {})
+
+    cfg_tcfg = cfg.get("training", {}) or {}
+    cfg_icfg = cfg.get("inference", {}) or {}
+
+    tcfg = dict(cfg_tcfg)
+    icfg = dict(cfg_icfg)
+    fallbacks = []
+
+    for k in _TRAINING_KEYS_FROM_BUNDLE:
+        if k in bundle_tcfg:
+            tcfg[k] = bundle_tcfg[k]
+        elif k in cfg_tcfg:
+            fallbacks.append(f"training.{k}")
+    for k in _INFERENCE_KEYS_FROM_BUNDLE:
+        if k in bundle_icfg:
+            icfg[k] = bundle_icfg[k]
+        elif k in cfg_icfg:
+            fallbacks.append(f"inference.{k}")
+
+    if fallbacks:
+        print(
+            "  [eval-cfg] bundle model_config missing these keys; falling back to "
+            f"current pipeline.yaml: {', '.join(fallbacks)}"
+        )
+    return tcfg, icfg
 
 
 def _trim_sequence_bundle(seq: dict, limit: int, cat_cols: list[str], target_cols: list[str]) -> dict:

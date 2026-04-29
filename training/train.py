@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import math
+import time
+from datetime import datetime, timezone
+
 import numpy as np
 
 from .data import make_decoder_inputs, mix_scheduled_sampling
@@ -59,17 +63,33 @@ def train(
     weights_path: str = "best_ss.weights.h5",
     sample_weight_train: dict | None = None,
     sample_weight_val: dict | None = None,
+    lr_schedule: str = "plateau",
+    # Plateau knobs:
     lr_patience: int = 0,
     lr_factor: float = 0.5,
     min_lr: float = 1e-7,
+    # Cosine warm restarts knobs:
+    cosine_t_0: int = 50,
+    cosine_t_mult: float = 2.0,
+    cosine_min_lr: float = 1e-7,
 ):
     """Per-epoch: compute SS rate, optionally mix teacher-forced+predicted decoder inputs, fit 1 epoch,
     manual early stopping with checkpoint save/restore.
 
-    Dynamic LR (ReduceLROnPlateau-style): when `lr_patience > 0`, the optimizer's
-    learning rate is multiplied by `lr_factor` after `lr_patience` epochs of no
-    val_loss improvement, floored at `min_lr`. `lr_patience=0` disables the
-    schedule and keeps LR constant at the optimizer's initial value.
+    Returns (history_logs, run_metadata). run_metadata captures train_start_utc /
+    train_end_utc / total_runtime_seconds / final_epoch / best_val_loss /
+    best_val_loss_epoch / stop_reason / lr_history / loss_history — saved into
+    model_config.json so a future engineer can reproduce or audit the run.
+
+    Dynamic LR — selected by `lr_schedule`:
+      - "plateau": ReduceLROnPlateau-style. When `lr_patience > 0`, the optimizer's
+        learning rate is multiplied by `lr_factor` after `lr_patience` epochs of no
+        val_loss improvement, floored at `min_lr`. `lr_patience=0` disables drops
+        and keeps LR constant at the optimizer's initial value.
+      - "cosine_restarts": SGDR. Per-epoch LR follows
+        cosine_min_lr + 0.5*(lr_max - cosine_min_lr)*(1 + cos(pi * T_cur / T_i)),
+        where lr_max = optimizer's initial LR, T_0 is the first cycle length, and
+        cycle length scales by `cosine_t_mult` after each restart.
     """
 
     dec_train_pure = make_decoder_inputs(y_train, n_classes, active_targets, predict_duration, y_dur_train)
@@ -87,16 +107,43 @@ def train(
     # Coerce scheduling kwargs — YAML can deliver ints/strings depending on literal
     # form (e.g. `min_lr: 1e-7` parses as a string under PyYAML SafeLoader; needs
     # `1.0e-7` for float). Fail loudly in the caller rather than deep in the loop.
-    lr_patience = int(lr_patience)
-    lr_factor   = float(lr_factor)
-    min_lr      = float(min_lr)
+    lr_patience   = int(lr_patience)
+    lr_factor     = float(lr_factor)
+    min_lr        = float(min_lr)
+    cosine_t_0    = int(cosine_t_0)
+    cosine_t_mult = float(cosine_t_mult)
+    cosine_min_lr = float(cosine_min_lr)
+
+    if lr_schedule not in ("plateau", "cosine_restarts"):
+        raise ValueError(f"Unknown lr_schedule={lr_schedule!r}; expected 'plateau' or 'cosine_restarts'")
+
+    # Snapshot the optimizer's initial LR — cosine treats this as lr_max.
+    lr_max = float(training_model.optimizer.learning_rate.numpy())
 
     history_logs = []
     best_val = np.inf
+    best_epoch = 0
     wait = 0
-    lr_wait = 0                                 # parallel counter for the LR schedule
+    lr_wait = 0                                 # plateau-mode stall counter
+
+    # Cosine warm restart bookkeeping.
+    cosine_T_i = cosine_t_0
+    cosine_T_cur = 0
+    cosine_cycle = 0
+
+    train_start = datetime.now(timezone.utc)
+    t0 = time.time()
+    stop_reason = "max_epochs"
+    last_epoch = 0
 
     for epoch in range(1, epochs + 1):
+        # Set LR for this epoch (cosine schedule fires before fit; plateau drops post-epoch).
+        if lr_schedule == "cosine_restarts":
+            new_lr = cosine_min_lr + 0.5 * (lr_max - cosine_min_lr) * (
+                1.0 + math.cos(math.pi * cosine_T_cur / max(cosine_T_i, 1))
+            )
+            training_model.optimizer.learning_rate.assign(new_lr)
+
         progress = min((epoch - 1) / max(ss_ramp_epochs, 1), 1.0) if ss_ramp_epochs > 0 else 1.0
         ss_rate = ss_start_rate + (ss_end_rate - ss_start_rate) * progress
         current_lr = float(training_model.optimizer.learning_rate.numpy())
@@ -130,7 +177,12 @@ def train(
         log["epoch"] = epoch
         log["ss_rate"] = float(ss_rate)
         log["lr"] = current_lr
+        if lr_schedule == "cosine_restarts":
+            log["cosine_cycle"] = cosine_cycle
+            log["cosine_T_cur"] = cosine_T_cur
+            log["cosine_T_i"] = cosine_T_i
         history_logs.append(log)
+        last_epoch = epoch
 
         val_loss = log["val_loss"]
         improved = val_loss < best_val
@@ -144,7 +196,7 @@ def train(
         print(f"  {'metric':<42} {'train':>10} {'val':>10}")
         train_keys = sorted(
             k for k in log
-            if not k.startswith("val_") and k not in ("epoch", "ss_rate")
+            if not k.startswith("val_") and k not in ("epoch", "ss_rate", "cosine_cycle", "cosine_T_cur", "cosine_T_i")
         )
         for k in train_keys:
             t = log.get(k, float("nan"))
@@ -154,15 +206,14 @@ def train(
 
         if improved:
             best_val = val_loss
+            best_epoch = epoch
             wait = 0
             lr_wait = 0
             training_model.save_weights(weights_path)
         else:
             wait += 1
             lr_wait += 1
-            # Drop LR when the secondary counter trips, independent of early stopping.
-            # Resets lr_wait so the next drop requires another lr_patience epochs of stall.
-            if lr_patience > 0 and lr_wait >= lr_patience:
+            if lr_schedule == "plateau" and lr_patience > 0 and lr_wait >= lr_patience:
                 new_lr = max(current_lr * lr_factor, min_lr)
                 if new_lr < current_lr:
                     training_model.optimizer.learning_rate.assign(new_lr)
@@ -170,8 +221,35 @@ def train(
                 lr_wait = 0
             if wait >= early_stopping_patience:
                 print(f"Early stopping at epoch {epoch}")
+                stop_reason = "early_stopping"
                 break
 
+        # Advance cosine schedule state at end-of-epoch.
+        if lr_schedule == "cosine_restarts":
+            cosine_T_cur += 1
+            if cosine_T_cur >= cosine_T_i:
+                cosine_T_cur = 0
+                cosine_T_i = max(int(round(cosine_T_i * cosine_t_mult)), 1)
+                cosine_cycle += 1
+                print(f"  Cosine WR restart -> cycle {cosine_cycle}, next T_i={cosine_T_i}")
+
     training_model.load_weights(weights_path)
+    train_end = datetime.now(timezone.utc)
     print(f"Training complete. Best val_loss: {best_val:.6f}")
-    return history_logs
+
+    run_metadata = {
+        "train_start_utc": train_start.isoformat(timespec="seconds"),
+        "train_end_utc":   train_end.isoformat(timespec="seconds"),
+        "total_runtime_seconds": float(time.time() - t0),
+        "final_epoch":           int(last_epoch),
+        "best_val_loss":         float(best_val) if best_val != np.inf else None,
+        "best_val_loss_epoch":   int(best_epoch),
+        "stop_reason":           stop_reason,
+        "lr_schedule":           lr_schedule,
+        "lr_history":            [log["lr"] for log in history_logs],
+        "loss_history":          [
+            {"epoch": log["epoch"], "loss": log.get("loss"), "val_loss": log.get("val_loss")}
+            for log in history_logs
+        ],
+    }
+    return history_logs, run_metadata
