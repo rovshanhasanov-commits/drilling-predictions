@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -494,16 +495,18 @@ _INFERENCE_KEYS_FROM_BUNDLE = (
 def _hydrate_eval_cfg(model_config: dict, cfg: dict) -> tuple[dict, dict]:
     """Build (tcfg, icfg) for eval, prioritizing the bundle's model_config.json.
 
-    `model_config["effective_cfg"]["training" | "inference"]` is the authoritative
-    source for training-derived knobs (the cfg snapshot at training time, after
-    any Colab override-cell mods). For each expected key missing from the bundle
-    we fall back to the current pipeline.yaml cfg and print a warning naming the
-    fallback — surfaces stale bundles loudly without hard-failing.
+    Source-of-truth precedence per key:
+      1. `model_config["effective_cfg"]["training"|"inference"]` (schema_version >= 2 —
+         the cfg snapshot at training time, after any Colab override-cell mods).
+      2. Top-level `model_config[<key>]` (schema_version 1 / flat layout — older
+         bundles only had a small set of training fields at the top level).
+      3. Current `pipeline.yaml`. A warning names each key that ended up here.
 
     Data paths and CLI args still come from `cfg` / argparse — they describe
     where to look now, not what was trained.
     """
-    eff = (model_config or {}).get("effective_cfg") or {}
+    mc = model_config or {}
+    eff = mc.get("effective_cfg") or {}
     bundle_tcfg = (eff.get("training") or {})
     bundle_icfg = (eff.get("inference") or {})
 
@@ -517,6 +520,8 @@ def _hydrate_eval_cfg(model_config: dict, cfg: dict) -> tuple[dict, dict]:
     for k in _TRAINING_KEYS_FROM_BUNDLE:
         if k in bundle_tcfg:
             tcfg[k] = bundle_tcfg[k]
+        elif k in mc:                                 # schema v1 — flat top-level
+            tcfg[k] = mc[k]
         elif k in cfg_tcfg:
             fallbacks.append(f"training.{k}")
     for k in _INFERENCE_KEYS_FROM_BUNDLE:
@@ -569,7 +574,28 @@ def _effective_model_folder_name(cfg: dict, args) -> str:
 def _build_out_dir(cfg: dict, args) -> Path:
     results_root = resolve(cfg, cfg["training"]["results_dir"])
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return results_root / _effective_model_folder_name(cfg, args) / f"eval_{ts}"
+    out = results_root / _effective_model_folder_name(cfg, args) / f"eval_{ts}"
+    return _long_path(out)
+
+
+def _long_path(p: Path) -> Path:
+    """On Windows, prepend the `\\\\?\\` extended-length prefix when the resolved
+    path is close to the legacy MAX_PATH (260) ceiling.
+
+    The deep project tree + timestamped bundle folder + `eval_<ts>/` can exceed
+    MAX_PATH even though individual components are short, which makes mkdir /
+    open fail with WinError 206. The `\\\\?\\` prefix opts the path into the
+    long-path API (~32K chars) and is preserved through pathlib.Path operations
+    and pandas to_csv.
+    """
+    if os.name != "nt":
+        return p
+    s = str(p.resolve())
+    if s.startswith("\\\\?\\"):
+        return Path(s)
+    if len(s) < 240:
+        return p
+    return Path("\\\\?\\" + s)
 
 
 if __name__ == "__main__":
